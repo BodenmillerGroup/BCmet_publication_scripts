@@ -1,0 +1,1103 @@
+---
+title: "TumorPanel_04_ecological_diversity_indices_calculations"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+## Introduction
+
+This script produces no figures.It calculates ecological diversity the measures for all the different clustering options in the tumor panel. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(compositions)
+library(vegan)
+library(ComplexHeatmap)
+
+# Read SingleCellExperiment object
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1","Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7", 
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1")
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce1 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+#filter only patients with matched samples
+sce2 <-filterSCE(sce1, matched_samples==1)
+#Check number of cells per patient sample:
+counts_per_sample <- table(sce2$sample_type, sce2$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<200)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+unique(sce2$Site.of.metastasis[sce2$Patient.ID %in% patient_to_exclude])
+
+sce <- filterSCE(sce2, !(sce2$Patient.ID %in% patient_to_exclude))
+#Repeat tissue type as condition for plotting functions in CATALYST
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$condition <- factor(sce$Tissue.Type)
+sce$Patient.ID <- factor(sce$Patient.ID)
+sce$Location <- factor(sce$Location)
+
+
+colSums(table(sce$Patient.ID,sce$Site.of.metastasis)!=0)
+colSums(table(sce$Patient.ID,sce$Tissue.Type)!=0)
+colSums(table(sce$Patient.ID,sce$molecular.subtype)!=0)
+```
+
+
+### CALCULATE ECOLOGICAL DIVERSITY MEASURES
+
+# First for main 20 flowSOM clusters
+
+```{r flowSOM-20}
+
+#big flowSOM clusters
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+diversity_metadata <- read.csv("data/patient_metadata_encoded.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+
+ diversity_metadata$shannon_pt[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Calculate similarity only using intratumoral region of the primary tumor
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="intratumoral")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_intra[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+### Only stromal region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="stromal")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_stromal[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ diversity_metadata$shannon_pt_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Only margin region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="margin")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE, na.rm = TRUE)
+ diversity_metadata$L2_transformed_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_margin[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+}
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+diversity_metadata_big_flowsom <-diversity_metadata
+
+
+```
+
+### Graph-based clustering
+
+```{r graph-based-clusters}
+
+#1) Graph-based clustering
+sce$cluster_id <- sce$epithelial_phenograph_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_encoded.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+
+ diversity_metadata$shannon_pt[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Calculate similarity only using intratumoral region of the primary tumor
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="intratumoral")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_intra[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+### Only stromal region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="stromal")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_stromal[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ diversity_metadata$shannon_pt_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Only margin region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="margin")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE, na.rm = TRUE)
+ diversity_metadata$L2_transformed_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_margin[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+}
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+diversity_metadata_gb <-diversity_metadata
+```
+
+### flowSOM 45 clusters
+
+```{r flowSOM-45-clusters}
+#2) flowSOM 45 clusters
+sce$cluster_id <- sce$flowSOM_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_encoded.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+
+ diversity_metadata$shannon_pt[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Calculate similarity only using intratumoral region of the primary tumor
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="intratumoral")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_intra[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+### Only stromal region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="stromal")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_stromal[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ diversity_metadata$shannon_pt_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Only margin region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="margin")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE, na.rm = TRUE)
+ diversity_metadata$L2_transformed_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_margin[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+}
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+diversity_metadata_flowsom <-diversity_metadata
+
+```
+
+### K means clustering
+
+```{r kmeans-clusters}
+#3) K-means clusters
+sce$cluster_id <- sce$kmeans_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_encoded.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+
+ diversity_metadata$shannon_pt[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Calculate similarity only using intratumoral region of the primary tumor
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="intratumoral")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_intra[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_intra[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_intra[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+### Only stromal region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="stromal")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_stromal[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_stromal[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ diversity_metadata$shannon_pt_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_stromal[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+
+### Only margin region of PT
+
+sce_filtered1 <- filterSCE(sce,Tissue.Type=="PT")
+sce_filtered <- filterSCE(sce_filtered1,Location=="margin")
+
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1))
+x <- f-rowMeans(f)
+f <- log(prop.table(y_met + 1, 1))
+y <- f-rowMeans(f)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE, na.rm = TRUE)
+ diversity_metadata$L2_transformed_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard_margin[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice_margin[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+}
+}
+
+x = t(fq_per_patient_pt)
+y = t(fq_per_patient_met)
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ 
+ diversity_metadata$shannon_pt_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[1,], index = 'shannon')
+ diversity_metadata$shannon_met_margin[diversity_metadata$Patient.ID == patientID] <- diversity(abundances[2,], index = 'shannon')
+}
+
+diversity_metadata_kmeans <-diversity_metadata
+```
+
+
+```{r}
+##save results
+write.table(diversity_metadata_kmeans, "data/patient_metadata_kmeans.csv",sep = ",", row.names = FALSE,quote = FALSE)
+
+write.table(diversity_metadata_flowsom, "data/patient_metadata_flowSOM.csv",sep = ",", row.names = FALSE,quote = FALSE)
+
+write.table(diversity_metadata_gb, "data/patient_metadata_graph_based.csv",sep = ",", row.names = FALSE,quote = FALSE)
+
+write.table(diversity_metadata_big_flowsom, "data/patient_metadata_final_big_flowSOM.csv",sep = ",", row.names = FALSE,quote = FALSE)
+```
+

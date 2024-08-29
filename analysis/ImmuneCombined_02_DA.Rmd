@@ -1,0 +1,672 @@
+---
+title: "ImmuneCombined_02_DA"
+author: "SandraTietscher"
+date: "2021-12-20"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(cowplot)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(CATALYST)
+library(viridis)
+library(ggpubr)
+library(edgeR)
+
+# Read immune sce
+sce_immune <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_immune$patient.tissue <- paste(sce_immune$Patient.ID, sce_immune$Tissue.Type, sep = "_")
+sce_immune$MetPT <- ifelse(sce_immune$Tissue.Type == "PT", "PT", "Met")
+sce_immune$patient.tissue.loc <- paste(sce_immune$patient.tissue, sce_immune$Location, sep = "_")
+
+# Read macrophage sce
+sce_M <- readRDS("output/SCEs/myeloid/myeloidSCE_M.rds")
+sce_M$patient.tissue <- paste(sce_M$Patient.ID, sce_M$Tissue.Type, sep = "_")
+sce_M$MetPT <- ifelse(sce_M$Tissue.Type == "PT", "PT", "Met")
+sce_M$patient.tissue.loc <- paste(sce_M$patient.tissue, sce_M$Location, sep = "_")
+
+```
+
+# Plot primary tumor and metastais PCA plots for general immune cells, T cells and myeloid cells
+```{r pca-immune-phenotypes}
+#Myeloid cells
+sce_M$sample_type[sce_M$Tissue.Type == 'PT'] <- "PT"
+sce_M$sample_type[sce_M$Tissue.Type == 'Liver'] <- "M"
+sce_M$sample_type[sce_M$Tissue.Type == 'Bone'] <- "M"
+sce_M$sample_type[sce_M$Tissue.Type == 'Brain'] <- "M"
+sce_M$sample_type[sce_M$Tissue.Type == 'SoftTissue'] <- "M"
+sce_M$sample_type <- factor(sce_M$sample_type)
+sce_M$sample_id <- factor(paste(sce_M$Patient.ID, sce_M$sample_type)) 
+sce_M$cluster_id <- sce_M$M_cluster
+
+metadata(sce_M)$cluster_codes <- data.frame(custom = factor(levels(sce_M$cluster_id)), levels = levels(sce_M$cluster_id))
+sce_M$condition <- factor(sce_M$Tissue.Type, levels = c( "PT", "Bone", "Brain","Liver","SoftTissue"))
+clrDR(sce_M, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= TRUE)
+
+
+#Immune cells
+sce_immune$sample_type[sce_immune$Tissue.Type == 'PT'] <- "PT"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Liver'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Bone'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Brain'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'SoftTissue'] <- "M"
+sce_immune$sample_type <- factor(sce_immune$sample_type)
+sce_immune$sample_id <- factor(paste(sce_immune$Patient.ID, sce_immune$sample_type))
+sce_immune$condition <- factor(sce_immune$Tissue.Type, levels = c( "PT", "Bone", "Brain","Liver","SoftTissue"))
+
+# Subset object
+sce_immune <- sce_immune[,which(sce_immune$cell_class == "immune")]
+# Exclude HLA-DR_high cells (undefined cell class)
+sce_immune <- sce_immune[,which(sce_immune$celltype != "HLA-DR_high")]
+# Classify neutrophils as myeloid cells
+sce_immune$celltype <- ifelse(sce_immune$celltype == "neutrophil", "myeloid", sce_immune$celltype)
+
+sce_immune$cluster_id <- as.factor(sce_immune$celltype)
+metadata(sce_immune)$cluster_codes <- data.frame(custom = factor(levels(sce_immune$cluster_id)), levels = levels(sce_immune$cluster_id))
+clrDR(sce_immune, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= TRUE)
+
+
+# Subset object
+sce_T <- sce_immune[,which(sce_immune$Tcell_subtype != "none")]
+sce_T$cluster_id <- as.factor(sce_T$Tcell_subtype)
+metadata(sce_T)$cluster_codes <- data.frame(custom = factor(levels(sce_T$cluster_id)), levels = levels(sce_T$cluster_id))
+
+sce_T$sample_type[sce_T$Tissue.Type == 'PT'] <- "PT"
+sce_T$sample_type[sce_T$Tissue.Type == 'Liver'] <- "M"
+sce_T$sample_type[sce_T$Tissue.Type == 'Bone'] <- "M"
+sce_T$sample_type[sce_T$Tissue.Type == 'Brain'] <- "M"
+sce_T$sample_type[sce_T$Tissue.Type == 'SoftTissue'] <- "M"
+sce_T$sample_type <- factor(sce_T$sample_type)
+sce_T$sample_id <- factor(paste(sce_T$Patient.ID, sce_T$sample_type))
+
+clrDR(sce_T, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= TRUE)
+```
+
+
+
+
+
+
+
+# All locations: Differential abundance of cell types in PT vs met metastasis 
+
+Patient matching is accounted for by adding Patient ID to the design matrix for the model.
+Location is accounted for by adding it as an additional blocking factor to the design matrix.
+
+### General immune cells
+
+Over all metastatic tissues combined
+
+```{r immuneCells-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_immune <- sce_immune[,which(sce_immune$cell_class == "immune")]
+
+# Exclude HLA-DR_high cells (undefined cell class)
+sce_immune <- sce_immune[,which(sce_immune$celltype != "HLA-DR_high")]
+
+# Classify neutrophils as myeloid cells
+sce_immune$celltype <- ifelse(sce_immune$celltype == "neutrophil", "myeloid", sce_immune$celltype)
+
+# Prepare abundance object
+abundances <- table(sce_immune$celltype, sce_immune$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_immune)[match(colnames(abundances), sce_immune$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res)$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r immuneCells-sepSites, fig.width=9, fig.height=5}
+
+# Relevel so that PT is the baseline group
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+
+```
+
+### T cell subtypes
+
+Over all metastatic tissues combined
+
+```{r Tcells-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_T <- sce_immune[,which(sce_immune$Tcell_subtype != "none")]
+
+# Prepare abundance object
+abundances <- table(sce_T$Tcell_subtype, sce_T$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_T)[match(colnames(abundances), sce_T$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res, n = 15)$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r Tcells-sepSites, fig.width=9, fig.height=5}
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res, n = 15)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+
+```
+
+
+### Myeloid cell subtypes
+
+Over all metastatic tissues combined
+
+```{r myeloid-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_M <- sce_M[,which(sce_M$M_cluster != "none")]
+
+# Prepare abundance object
+abundances <- table(sce_M$M_cluster, sce_M$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_M)[match(colnames(abundances), sce_M$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res, n = 25)$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r myeloid-sepSites, fig.width=9, fig.height=5}
+
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Location + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res, n = 25)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+
+```
+
+
+# Intratumoral only locations: Differential abundance of cell types in PT vs met metastasis
+
+Only intratumoral images are used to prevent location bias.
+
+### General immune cells
+
+```{r immune-intratumoral-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_immune_intra <- sce_immune[,which(sce_immune$Location == "intratumoral")]
+
+# Prepare abundance object
+abundances <- table(sce_immune_intra$celltype, sce_immune_intra$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_immune_intra)[match(colnames(abundances), sce_immune_intra$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res)$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r immune-intratumoral-sepSites}
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+```
+
+
+### T cell subtypes
+
+Over all metastatic tissues combined
+
+```{r Tcells-intratumoral-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_T_intra <- sce_immune_intra[,which(sce_immune_intra$Tcell_subtype != "none")]
+
+# Prepare abundance object
+abundances <- table(sce_T_intra$Tcell_subtype, sce_T_intra$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_T_intra)[match(colnames(abundances), sce_T_intra$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res, n=15)$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r Tcell-intratumoral-sepSites, fig.width=9, fig.height=5}
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res, n=15)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+
+```
+
+
+### Myeloid cell subtypes
+
+Over all metastatic tissues combined
+
+```{r myeloid-intratumoral-allSites, fig.width=4.5, fig.height=3}
+# Subset object
+sce_M_intra <- sce_M[,which(sce_M$Location == "intratumoral")]
+
+# Prepare abundance object
+abundances <- table(sce_M_intra$M_cluster, sce_M_intra$patient.tissue.loc) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_M_intra)[match(colnames(abundances), sce_M_intra$patient.tissue.loc),]
+MetPT <- factor(meta$MetPT)
+meta$MetPT <- relevel(x=MetPT, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$MetPT)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + MetPT, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- topTags(res, n = 25)$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+# Sort by logFC
+order <- rownames(DA[order(DA$logFC),])
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("All met vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For each metastatic tissue separately.
+
+```{r myeloid-intratumoral-sepSites, fig.width=9, fig.height=5}
+Tissue.Type <- factor(meta$Tissue.Type)
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+y.ab <- DGEList(abundances, samples=meta, group = meta$Tissue.Type)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add Location to account for different tumor regions, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + Tissue.Type, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+p.list <- list()
+
+for (i in colnames(fit.ab)[(ncol(fit.ab)-3):ncol(fit.ab)]) {
+
+  res <- glmQLFTest(fit.ab, coef=i)
+  summary(decideTests(res))
+  DA <- topTags(res, n = 25)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+p.list[[i]] <- ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+}
+
+plot_grid(plotlist = p.list, ncol = 2)
+
+```
+
+

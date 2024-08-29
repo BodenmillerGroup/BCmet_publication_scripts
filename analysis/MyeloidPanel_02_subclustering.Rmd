@@ -1,0 +1,179 @@
+---
+title: "MyeloidPanel_subclustering"
+author: "SandraTietscher"
+date: "2021-11-03"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+This script performs separate subclustering of myeloid cells based on subtype and cell state markers.
+
+
+# Load libraries and data
+
+First, we will load the needed libraries and the `SingleCellExperiment` object, that was created in the previous section.
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(dittoSeq)
+library(cowplot)
+library(scran)
+library(edgeR)
+library(CATALYST)
+library(cytomapper)
+
+# Read SingleCellExperiment object
+sce <- readRDS("output/SCEs/myeloid/myeloidSCE_clustered.rds")
+
+# Subset myeloid cells
+sce_M <- sce[,which(sce$celltype %in% c("myeloid"))]
+sce_Mfull <- sce[,which(sce$celltype %in% c("myeloid","LAMP3_DC", "pDC", "neutrophil"))]
+```
+
+# Choose genes for clustering and UMAP
+
+```{r choose-clustering-genes}
+
+markers_include_Mfull <- c("CD38", "HLA-DR", "CLEC9A", "CD68", "CD163", "CD11b", "CD204", "CD11c", "CD1c", "CD16", "MMP9", "CD274", "STING", "IDO", "CD33", "Arginase-1", "CD209", "CD40", "CD4", "CD14", "CD206", "LAMP3", "CD303", "MPO")
+
+markers_include_M <- c("CD38", "HLA-DR", "CLEC9A", "CD68", "CD163", "CD11b", "CD204", "CD11c", "CD1c", "CD16", "MMP9", "CD274", "STING", "IDO", "CD33", "Arginase-1", "CD209", "CD40", "CD4", "CD14", "CD206")
+```
+
+# UMAP representation
+
+```{r compute-UMAP}
+
+sce_M <- runUMAP(sce_M, exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_M, "normalized")) %in% markers_include_M)
+
+sce_Mfull <- runUMAP(sce_Mfull, exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_M, "normalized")) %in% markers_include_Mfull)
+```
+
+## Visualize features and marker expression levels on UMAP
+
+```{r visualize-features-umap, message = FALSE, fig.width=7, fig.height=5}
+dittoDimPlot(sce_Mfull, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_Mfull)$colour_vectors$tissuetype, opacity = 0.3) 
+
+dittoDimPlot(sce_Mfull, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                            color.panel = metadata(sce_Mfull)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.5)
+
+dittoDimPlot(sce_Mfull, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_Mfull)$colour_vectors$Location, opacity = 0.3)
+
+dittoDimPlot(sce_Mfull, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_Mfull)$colour_vectors$Location, split.by = "Location",opacity = 0.5)
+
+dittoDimPlot(sce_M, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                            color.panel = metadata(sce_Mfull)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.5)
+```
+
+```{r scaled-expression-umap, message=FALSE, fig.width=15, fig.height=10}
+p.list <- list()
+for(i in markers_include_Mfull){
+  p.list[[i]] <- plotUMAP(sce_Mfull, colour_by = i, by_exprs_values = "scaled", 
+                          point_size = 0.5, point_alpha = 1)  + scale_colour_gradient2(name = i, low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-3, 3), na.value = "#b2182b")
+}
+
+plot_grid(plotlist = p.list, ncol = 7)
+```
+
+
+# Run graph-based clustering
+
+Run this only for the subset of myeloid cells that have not yet been assigned to a subtype (i.e. sce_M).
+
+Use normalized counts for clustering, because this provides a better separation of noise and actual signal compared to arcsinh-transformed counts.  
+Include only markers that were also used for UMAP.
+
+
+```{r clustering}
+cluster_counts_normalized <- subset(assay(sce_M, "normalized"), rownames(assay(sce_M, "normalized")) %in% markers_include_M)
+
+g <- buildSNNGraph(cluster_counts_normalized, k=40, type = "jaccard")
+clust<- igraph::cluster_louvain(g)$membership
+table(clust)
+
+# add cluster information to sce object
+sce_M$cluster_k40<- as.factor(clust)
+
+## Cluster annotation
+sce_M$M_cluster <- paste0("M_c", sce_M$cluster_k40)
+
+#plot on UMAP
+dittoDimPlot(sce_M, var = "M_cluster", reduction.use = "UMAP", size = 0.5)
+dittoDimPlot(sce_M, var = "M_cluster", reduction.use = "UMAP", size = 0.5, split.by = "M_cluster")
+```
+
+Include clusters into full myeloid object and all together on UMAP.
+
+```{r merge-M-Mfull}
+sce_Mfull$M_cluster <- sce_Mfull$clustername
+M_ids <- colnames(sce_M)
+sce_Mfull[,M_ids]$M_cluster <- sce_M$M_cluster
+
+#select colors for subtypes
+M_col <- c("#CC99FF", "#7F00FF", "#CC00CC", "#FF66FF", "#CC0066", "#9A6767", "#990000", 
+           "#B30303", "#F03C3C", "#FF9999", "#FFB266", "#FF8000", "#CC6600", "#E6A73A",
+           "#FFAE33", "#D2BD50", "#F6E176", "#F9D20E", "#FFEA33", "#D7FF33")
+sce_Mfull$M_cluster <- factor(sce_Mfull$M_cluster)
+names(M_col) <- levels(sce_Mfull$M_cluster)
+
+dittoDimPlot(sce_Mfull, var = "M_cluster", reduction.use = "UMAP", size = 0.5, color.panel = M_col, do.label = TRUE, labels.size = 3)
+dittoDimPlot(sce_Mfull, var = "M_cluster", reduction.use = "UMAP", size = 0.5, split.by = "M_cluster")
+
+M_col_sub <- M_col[2:18]
+dittoDimPlot(sce_M, var = "M_cluster", reduction.use = "UMAP", size = 0.5, color.panel = M_col_sub, do.label = TRUE, labels.size = 3)
+dittoDimPlot(sce_M, var = "M_cluster", reduction.use = "UMAP", size = 0.5, color.panel = M_col_sub)
+```
+
+# Expression Heatmap of markers used for clustering/UMAP
+
+```{r ExprHeatmap_type_state, fig.width = 11, fig.height=6}
+sce_Mfull$sample_id <- sce_Mfull$ROI_ID
+sce_Mfull$cluster_id <- sce_Mfull$M_cluster
+
+rowData(sce_Mfull)$marker_class <- ifelse(rownames(sce_Mfull) %in% markers_include_Mfull, "type", "none")
+
+metadata(sce_Mfull)$cluster_codes <- data.frame(M_cluster = factor(sce_Mfull$M_cluster))
+
+plotExprHeatmap(sce_Mfull, 
+features ="type", by = "cluster_id", k = "M_cluster", col_dend = TRUE, assay = "counts", scale = "last",
+bars = TRUE, perc = TRUE, fun = "mean", k_pal = M_col)
+```
+
+# Plot subtype proportions per patient (separated by tissue type)
+
+```{r proportions-per-patient}
+sce_Mfull$sample_id <- sce_Mfull$Patient.ID
+sce_Mfull$condition <- factor(sce_Mfull$Tissue.Type)
+plotAbundances(sce_Mfull, k = "M_cluster", by = "sample_id", group_by = "condition")
+```
+
+# Save SCE objects
+
+Also add subtype information to full object and save.
+
+```{r save-SCE}
+sce$M_cluster <- "none"
+myeloid_ids <- colnames(sce_Mfull)
+sce[,myeloid_ids]$M_cluster <- as.character(sce_Mfull$M_cluster)
+
+saveRDS(sce, "output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+saveRDS(sce_M, "output/SCEs/myeloid/myeloidSCE_M_sub.rds")
+saveRDS(sce_Mfull, "output/SCEs/myeloid/myeloidSCE_M.rds")
+```
+

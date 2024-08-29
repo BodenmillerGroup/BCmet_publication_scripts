@@ -1,0 +1,324 @@
+---
+title: "TumorPanel_03_subclustering"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script analyzes epithelial cells by clustering the cells into phenotypes using different clustering approaches and vizualises the clusters in umap.
+
+# Load libraries and data
+
+First, we will load the needed libraries and the epithelial `SingleCellExperiment` object, that was created in the previous section.
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(bluster)
+```
+
+
+```{r set-up-sce}
+# Read SingleCellExperiment object
+sce_initial  <- readRDS("output/SCEs/tumor/tumorSCE_initial_clustered.rds")
+
+sce <- filterSCE(sce_initial, celltype == "Epithelial")
+
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+#REMOVE ER - umap plotting not working for ER
+markers_include_umap <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+#set up factors for CATALYST PACKAGE
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type))
+sce$Patient.ID <- factor(sce$Patient.ID)
+sce$N <- factor(sce$N)
+sce$T <- factor(sce$T)
+sce$M <- factor(sce$M)
+sce$Grade <- factor(sce$Grade)
+sce$Tissue.Type <- factor(sce$Tissue.Type)
+sce$PT <- factor(sce$PT)
+sce$ER <- factor(sce$ER)
+sce$PR <- factor(sce$PR)
+sce$Her2 <- factor(sce$Her2)
+sce$Site.of.metastasis <- factor(sce$Site.of.metastasis)
+sce$molecular.subtype <- factor(sce$molecular.subtype)
+sce$condition <- factor(sce$Tissue.Type)
+
+
+# Call clustering markers type, and others state markers as expected by CATALYST 
+all_markers <- rownames(rowData(sce))
+clustering_cols <- match(clustering_markers,all_markers)
+marker_class <- rep("state", length(rownames(rowData(sce))))
+marker_class[clustering_cols] <- "type"
+marker_class <- factor(marker_class, levels = c("type", "state"))
+rowData(sce)$marker_class <- marker_class
+
+```
+
+
+```{r graph-based-clustering}
+cluster_counts_normalized <- subset(assay(sce, "normalized"), rownames(assay(sce, "normalized")) %in% clustering_markers)
+
+g <- buildSNNGraph(cluster_counts_normalized, k=20, type = "jaccard")
+clust<- igraph::cluster_louvain(g)$membership
+table(clust)
+
+# add cluster information to sce object
+sce$epithelial_phenograph_clusters <- as.factor(clust)
+sce$cluster_id <- sce$epithelial_phenograph_clusters
+
+#metadata field has to be added for each clustering type ad hoc
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+saveRDS(sce, "output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+```
+
+
+```{r heatmap-median-expression-tumor-phenotypes-graph-based, fig.width=15, fig.height=10}
+
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+```
+
+
+```{r flowSOM-clustering-tumor}
+
+#Run flowSOM on scaled asinh transformed counts. CATALYST takes exprs assay as default, thus need to change the assays. 
+assay(sce, "asinh") <- assay(sce, "exprs")
+assay(sce, "exprs") <-assay(sce, "scaled")
+sce <- cluster(sce, features = "type", xdim = 5, ydim = 9, maxK = 20,  verbose = FALSE, seed = 999) 
+sce <- cluster(sce, features = "type", xdim = 5, ydim = 9, maxK = 20,  verbose = FALSE, seed = 999) 
+
+
+sce$flowSOM_clusters <- sce$cluster_id
+#change assays back for downstream analysis
+assay(sce, "exprs") <- assay(sce, "asinh")
+
+
+sce$cluster_id <- sce$flowSOM_clusters
+#metadata field has to be added for each clustering type ad hoc
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+```
+
+```{r heatmap-median-expression-tumor-phenotypes-flowSOM, fig.width=15, fig.height=10}
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+
+```
+
+```{r kmeans-clustering}
+cluster_counts_normalized <- subset(assay(sce, "normalized"), rownames(assay(sce, "normalized")) %in% clustering_markers)
+cluster_counts_normalized <- t(cluster_counts_normalized)
+cluster_counts_normalized <- round(cluster_counts_normalized,3)
+
+set.seed(42)
+Kmeans.output <- kmeans(cluster_counts_normalized,nstart=3,  centers =45, iter.max = 15 )
+
+sce$kmeans_clusters <- as.factor(Kmeans.output$cluster)
+sce$cluster_id <- sce$kmeans_clusters
+#metadata field has to be added for each clustering type ad hoc
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+```
+
+```{r heatmap-median-expression-tumor-phenotypes-kMeans, fig.width=15, fig.height=10}
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+```
+
+
+
+```{r heatmap-median-expression-tumor-phenotypes-flowSOM-final-clustering-20,fig.width=15, fig.height=10}
+#Run flowSOM on scaled asinh transformed counts. CATALYST takes exprs assay as default, thus need to change the assays. 
+assay(sce, "asinh") <- assay(sce, "exprs")
+assay(sce, "exprs") <-assay(sce, "scaled")
+sce <- cluster(sce, features = "type", xdim = 4, ydim = 5, maxK = 3,  verbose = FALSE, seed = 999) 
+sce <- cluster(sce, features = "type", xdim = 4, ydim = 5, maxK = 3,  verbose = FALSE, seed = 999) 
+
+sce$flowSOM_big_clusters <- sce$cluster_id
+
+#change assays back for downstream analysis
+assay(sce, "exprs") <- assay(sce, "asinh")
+
+sce$cluster_id <- sce$flowSOM_big_clusters
+#metadata field has to be added for each clustering type ad hoc
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+# add flowSOM 20 clusters to the initial SCE object
+
+sce_initial$celltypeTumorClusters <- sce_initial$celltype
+sce_initial$celltypeTumorClusters[sce_initial$celltypeTumorClusters == "Epithelial"]<- sce$flowSOM_big_clusters
+saveRDS(sce_initial, "output/SCEs/tumor/tumorSCE_initial_clustered_with_tumor_clusters.rds")
+
+
+```
+
+
+```{r save-sce}
+saveRDS(sce, "output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+```
+
+
+## Calculate UMAP on a subset of the cells
+
+```{r compute-UMAP-epithelial-cells}
+
+sce$cellID <- rownames(colData(sce))
+
+# For images with less than 300 cells: Use all cells
+as.data.frame(table(sce$ImageNumber)) %>% 
+  filter(Freq < 300) %>% 
+  pull(Var1) -> small.images
+cell_idx_smallImages <- sce[, which(sce$ImageNumber %in% small.images)]$cellID
+
+# For image with more than 300 cells: Randomly sample 300 cells
+colData(sce[,which(!(sce$ImageNumber %in% small.images))]) %>%
+  as.data.frame() %>%
+  group_by(ImageNumber) %>%
+  sample_n(300) %>% 
+  pull(cellID) -> cell_idx_largeImages
+
+cell_idx <- c(cell_idx_largeImages, cell_idx_smallImages)
+sce_sub <- sce[,cell_idx]
+
+# Run Dimensional reduction
+sce_sub <- runUMAP(sce_sub, exprs_values = "normalized",n_neighbors =15,
+                     subset_row = rownames(assay(sce_sub, "normalized")) %in% clustering_markers)
+
+```
+
+
+## Visualize clusters on UMAP
+
+
+```{r plot-clusters-umap-flowSOM}
+
+sce$cluster_id <- sce$flowSOM_clusters
+# add cluster information to sce_sub object
+sub_cellnames <- colnames(sce_sub)
+cluster_sub <- sce[,sub_cellnames]$cluster_id
+sce_sub$cluster_id <- cluster_sub
+
+dittoDimPlot(sce_sub, var = "cluster_id", reduction.use = "UMAP", size = 0.5, do.label = TRUE, opacity = 0.5)
+
+```
+
+```{r plot-clusters-umap-kMeans}
+
+sce$cluster_id <- sce$kmeans_clusters
+
+# add cluster information to sce_sub object
+sub_cellnames <- colnames(sce_sub)
+cluster_sub <- sce[,sub_cellnames]$cluster_id
+sce_sub$cluster_id <- cluster_sub
+
+dittoDimPlot(sce_sub, var = "cluster_id", reduction.use = "UMAP", size = 0.5, do.label = TRUE, opacity = 0.5)
+```
+
+```{r plot-clusters-umap-fgraph-based}
+
+sce$cluster_id <- sce$epithelial_phenograph_clusters
+
+# add cluster information to sce_sub object
+sub_cellnames <- colnames(sce_sub)
+cluster_sub <- sce[,sub_cellnames]$cluster_id
+sce_sub$cluster_id <- cluster_sub
+
+dittoDimPlot(sce_sub, var = "cluster_id", reduction.use = "UMAP", size = 0.5, do.label = TRUE, opacity = 0.5)
+
+```
+
+```{r plot-clusters-umap-fsom20-final}
+
+sce$cluster_id <- sce$flowSOM_big_clusters
+
+# add cluster information to sce_sub object
+sub_cellnames <- colnames(sce_sub)
+cluster_sub <- sce[,sub_cellnames]$cluster_id
+sce_sub$cluster_id <- cluster_sub
+
+dittoDimPlot(sce_sub, var = "cluster_id", reduction.use = "UMAP", size = 0.5, do.label = TRUE, opacity = 0.5)
+
+```
+
+## Visualize features on UMAP
+
+```{r visualize-tumor-features-umap}
+
+dittoDimPlot(sce_sub, var = "Patient.ID", reduction.use = "UMAP", size = 0.5, opacity = 0.5)
+
+dittoDimPlot(sce_sub, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$tissuetype, opacity = 0.3) 
+
+dittoDimPlot(sce_sub, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.5) 
+
+dittoDimPlot(sce_sub, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$Location, opacity = 0.3)
+
+dittoDimPlot(sce_sub, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$Location, split.by = "Location",opacity = 0.5)
+```
+
+## Visualize expression on UMAP
+
+Visualize the expression of each marker.
+
+### 1. Arcsinh-transformed counts
+
+```{r arcsinh-expression-tumor-markers-umap, fig.width=15, fig.height=10}
+p.list <- list()
+for(i in markers_include_umap){
+  p.list[[i]] <- plotUMAP(sce_sub, colour_by = i, by_exprs_values = "exprs", 
+                          point_size = 0.5, point_alpha = 1)
+}
+
+plot_grid(plotlist = p.list, ncol = 7)
+```
+

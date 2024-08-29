@@ -1,0 +1,754 @@
+---
+title: "Combined_Fig6_per_patient_delta_mean_expression_PT_MET"
+author: "LK"
+date: "2021-03-30"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+This scripts examines mean marker level differences of tumor and immune compartment between PT and metastatic samples
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(dittoSeq)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(cowplot)
+library(CATALYST)
+library(viridis)
+library(ggpubr)
+library(psych)
+
+# Read immune sce
+sce_immune_initial <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_immune_initial$patient.tissue <- paste(sce_immune_initial$Patient.ID, sce_immune_initial$Tissue.Type, sep = "_")
+sce_immune_initial$patient.tissue.loc <- paste(sce_immune_initial$patient.tissue, sce_immune_initial$Location, sep = "_")
+
+sce_immune <- sce_immune_initial[,which(sce_immune_initial$cell_class == "immune")]
+sce_immune$celltype <- ifelse(sce_immune$celltype == "T_cell", sce_immune$clustername, sce_immune$celltype)
+
+# Read macrophage sce
+sce_mac_initial <- readRDS("output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+sce_mac_initial$patient.tissue <- paste(sce_mac_initial$Patient.ID, sce_mac_initial$Tissue.Type, sep = "_")
+sce_mac_initial$patient.tissue.loc <- paste(sce_mac_initial$patient.tissue, sce_mac_initial$Location, sep = "_")
+sce_mac <- filterSCE(sce_mac_initial,cell_class=="immune")
+
+
+# Read in ROI metadata
+ROI_meta <- read.csv("data/immune_images_patient_metadata_encoded.csv")
+
+ROI_meta <- ROI_meta[ROI_meta$Location != "na",]
+ROI_meta$patient.tissue <- paste(ROI_meta$Patient.ID, ROI_meta$Tissue.Type, sep = "_")
+sample_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue),]
+rownames(sample_unique) <- sample_unique$patient.tissue
+
+ROI_meta$patient.tissue.loc <- paste(ROI_meta$patient.tissue, ROI_meta$Location, sep = "_")
+ROI_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue.loc),]
+rownames(ROI_unique) <- ROI_unique$patient.tissue.loc
+
+
+#set up factors for CATALYST PACKAGE
+sce_immune$sample_type[sce_immune$Tissue.Type == 'PT'] <- "PT"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Liver'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Bone'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'Brain'] <- "M"
+sce_immune$sample_type[sce_immune$Tissue.Type == 'SoftTissue'] <- "M"
+sce_immune$sample_type <- factor(sce_immune$sample_type)
+
+# Set up necessary fields for CATALYST plotting functions
+sce_immune$sample_id <- factor(paste(sce_immune$Patient.ID, sce_immune$sample_type))
+
+#Convert metadata into factors so that CATALYST package will treat these as expected
+sce_immune$N <- factor(sce_immune$N)
+sce_immune$T <- factor(sce_immune$T)
+sce_immune$M <- factor(sce_immune$M)
+sce_immune$Grade <- factor(sce_immune$Grade)
+sce_immune$Tissue.Type <- factor(sce_immune$Tissue.Type)
+sce_immune$PT <- factor(sce_immune$PT)
+sce_immune$ER <- factor(sce_immune$ER)
+sce_immune$PR <- factor(sce_immune$PR)
+sce_immune$Her2 <- factor(sce_immune$Her2)
+sce_immune$Site.of.metastasis <- factor(sce_immune$Site.of.metastasis)
+sce_immune$molecular.subtype <- factor(sce_immune$molecular.subtype)
+sce_immune$Location <- factor(sce_immune$Location)
+
+sce_immune$Tcell_subtype <- as.factor(sce_immune$Tcell_subtype)
+sce_immune$Tcell_cluster <- factor(sce_immune$Tcell_cluster)
+
+sce_immune$cluster_id <- sce_immune$Tcell_subtype
+metadata(sce_immune)$cluster_codes <- data.frame(custom = factor(levels(sce_immune$cluster_id)), levels = levels(sce_immune$cluster_id))
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce_immune$Patient.ID, immune_pheno$Patient.ID)]
+sce_immune$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce_immune$Patient.ID, immune_pheno$Patient.ID)]
+sce_immune$immunePT_Met <- factor(immune_pheno_name1)
+
+
+
+
+#set up factors for CATALYST PACKAGE
+sce_mac$sample_type[sce_mac$Tissue.Type == 'PT'] <- "PT"
+sce_mac$sample_type[sce_mac$Tissue.Type == 'Liver'] <- "M"
+sce_mac$sample_type[sce_mac$Tissue.Type == 'Bone'] <- "M"
+sce_mac$sample_type[sce_mac$Tissue.Type == 'Brain'] <- "M"
+sce_mac$sample_type[sce_mac$Tissue.Type == 'SoftTissue'] <- "M"
+sce_mac$sample_type <- factor(sce_mac$sample_type)
+
+# Set up necessary fields for CATALYST plotting functions
+sce_mac$sample_id <- factor(paste(sce_mac$Patient.ID, sce_mac$sample_type))
+
+#Convert metadata into factors so that CATALYST package will treat these as expected
+sce_mac$N <- factor(sce_mac$N)
+sce_mac$T <- factor(sce_mac$T)
+sce_mac$M <- factor(sce_mac$M)
+sce_mac$Grade <- factor(sce_mac$Grade)
+sce_mac$Tissue.Type <- factor(sce_mac$Tissue.Type)
+sce_mac$PT <- factor(sce_mac$PT)
+sce_mac$ER <- factor(sce_mac$ER)
+sce_mac$PR <- factor(sce_mac$PR)
+sce_mac$Her2 <- factor(sce_mac$Her2)
+sce_mac$Site.of.metastasis <- factor(sce_mac$Site.of.metastasis)
+sce_mac$molecular.subtype <- factor(sce_mac$molecular.subtype)
+sce_mac$Location <- factor(sce_mac$Location)
+
+sce_mac$cluster_id <- sce_mac$M_cluster
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce_mac$Patient.ID, immune_pheno$Patient.ID)]
+sce_mac$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce_mac$Patient.ID, immune_pheno$Patient.ID)]
+sce_mac$immunePT_Met <- factor(immune_pheno_name1)
+
+
+### epithelial sce
+
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin",
+                       "CK8_18_19","ER", "CK14","p53", "GLUT1","Bcl-2" ,
+                       "HER2", "CK5" ,"CD274","AR","GATA3","CK7", 
+                       "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1")
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce1 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+#filter only patients with matched samples
+sce2 <-filterSCE(sce1, matched_samples==1)
+#Check number of cells per patient sample:
+counts_per_sample <- table(sce2$sample_type, sce2$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<200)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+unique(sce2$Site.of.metastasis[sce2$Patient.ID %in% patient_to_exclude])
+
+sce_epi <- filterSCE(sce2,!(sce2$Patient.ID %in% patient_to_exclude))
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce_epi$Patient.ID, immune_pheno$Patient.ID)]
+sce_epi$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce_epi$Patient.ID, immune_pheno$Patient.ID)]
+sce_epi$immunePT_Met <- factor(immune_pheno_name1)
+
+```
+
+
+# Add local functions for plotting purposes (taken from CATALYST packages)
+```{r}
+#local functions from https://github.com/HelenaLC/CATALYST/blob/54bd90dedcef529b59cf13aa72a84eb63e669af9/R/plotExprHeatmap.R
+local_split_cells <- function(x, by) {
+    stopifnot(is.character(by), by %in% colnames(colData(x)))
+    cd <- as.data.frame(colData(x))
+    dt <- data.table::data.table(cd, i = seq_len(ncol(x)))
+    dt_split <- split(dt, by = by, sorted = TRUE, flatten = FALSE)
+    purrr::map_depth(dt_split, length(by), "i")
+}
+
+local_agg <- function(x, 
+    by = c("cluster_id", "sample_id"), 
+    fun = c("median", "mean", "sum"),
+    assay = "exprs") {
+    fun <- match.arg(fun)
+    y <- assay(x, assay)
+    if (fun == "median" && !is.matrix(y))
+        y <- as.matrix(y)
+    fun <- switch(fun, 
+        median = rowMedians, 
+        mean = rowMeans, 
+        sum = rowSums)
+    cs <- local_split_cells(x, by)
+    pb <- purrr::map_depth(cs, -1, function(i) {
+        if (length(i) == 0) return(numeric(nrow(x)))
+        fun(y[, i, drop = FALSE])
+    })
+    purrr::map_depth(pb, -2, function(u) as.matrix(data.frame(
+        u, row.names = rownames(x), check.names = FALSE)))
+}
+
+
+```
+
+### Epithelial cells mean delta change
+```{r}
+patient_level_md <- read.csv("data/patient_metadata_encoded.csv")
+rownames(patient_level_md) <- patient_level_md$Patient.ID
+
+sce_filtered2 <- filterSCE(sce_epi, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_pt <- patient_means_pt[ !(rownames(patient_means_pt) %in% c("HH3","H3K27me3", "SMA")), ] 
+
+
+sce_filtered2 <- filterSCE(sce_epi, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_met <- patient_means_met[ !(rownames(patient_means_met) %in% c("HH3","H3K27me3", "SMA")), ] 
+
+patient_means_pt <- patient_means_pt[,colnames(patient_means_pt) %in% colnames(patient_means_met)]
+patient_means_met <- patient_means_met[,colnames(patient_means_met) %in% colnames(patient_means_pt)]
+
+delta_mean_epi <- round(patient_means_met-patient_means_pt,2)
+rownames(delta_mean_epi)<- paste(rownames(delta_mean_epi), "_tumor",sep = "")
+
+PT_means_tumor<- patient_means_pt
+Met_means_tumor<- patient_means_met
+```
+
+
+### Get mean expression for epithelial cells from T cell and myeloid panel
+```{r}
+sce_stroma <- filterSCE(sce_immune_initial, cell_class == "epithelial")
+
+markers_for_stroma <- c("CXCL12","CD44", "B2M")
+sce <- filterSCE(sce_stroma, rownames(sce_stroma) %in% markers_for_stroma)
+
+# Set up necessary fields for CATALYST plotting functions
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$Tissue.Type))
+
+#Convert metadata into factors so that CATALYST package will treat these as expected
+sce$N <- factor(sce$N)
+sce$T <- factor(sce$T)
+sce$M <- factor(sce$M)
+sce$Grade <- factor(sce$Grade)
+sce$Tissue.Type <- factor(sce$Tissue.Type)
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$PT <- factor(sce$PT)
+sce$ER <- factor(sce$ER)
+sce$PR <- factor(sce$PR)
+sce$Her2 <- factor(sce$Her2)
+sce$Site.of.metastasis <- factor(sce$Site.of.metastasis)
+sce$molecular.subtype <- factor(sce$molecular.subtype)
+
+
+# Call clustering markers type, and others state markers as expected by CATALYST 
+rowData(sce)$antigen <- rowData(sce)$target
+clustering_markers <- c("DNA1")
+all_markers <- rownames(rowData(sce))
+clustering_cols <- match(clustering_markers,all_markers)
+marker_class <- rep("state", length(rownames(rowData(sce))))
+marker_class[clustering_cols] <- "type"
+marker_class <- factor(marker_class, levels = c("type", "state"))
+rowData(sce)$marker_class <- marker_class
+
+
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+
+
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+
+sce_filtered2 <- filterSCE(sce, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+sce_filtered2 <- filterSCE(sce, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+patient_means_pt <- patient_means_pt[,colnames(patient_means_pt) %in% colnames(delta_mean_epi)]
+patient_means_met <- patient_means_met[,colnames(patient_means_met) %in% colnames(delta_mean_epi)]
+
+delta_mean_epi_immune <- round(patient_means_met-patient_means_pt,2)
+rownames(delta_mean_epi_immune)<- paste(rownames(delta_mean_epi_immune), "_tumor",sep = "")
+
+delta_mean_epi<- rbind(delta_mean_epi, delta_mean_epi_immune)
+
+PT_means_tumor<- rbind(patient_means_pt,PT_means_tumor)
+Met_means_tumor<- rbind(patient_means_met,Met_means_tumor )
+
+```
+
+### Epithelial cells from myleoid panel
+
+```{r}
+sce_stroma <- filterSCE(sce_mac_initial, cell_class == "epithelial")
+
+markers_for_stroma <- c("Arginase-1" ,"MMP9", "IDO", "HLA-DR")
+
+sce <- filterSCE(sce_stroma, rownames(sce_stroma) %in% markers_for_stroma)
+
+# Set up necessary fields for CATALYST plotting functions
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$Tissue.Type))
+
+#Convert metadata into factors so that CATALYST package will treat these as expected
+sce$N <- factor(sce$N)
+sce$T <- factor(sce$T)
+sce$M <- factor(sce$M)
+sce$Grade <- factor(sce$Grade)
+sce$Tissue.Type <- factor(sce$Tissue.Type)
+sce$PT <- factor(sce$PT)
+sce$ER <- factor(sce$ER)
+sce$PR <- factor(sce$PR)
+sce$Her2 <- factor(sce$Her2)
+sce$Site.of.metastasis <- factor(sce$Site.of.metastasis)
+sce$molecular.subtype <- factor(sce$molecular.subtype)
+
+
+# Call clustering markers type, and others state markers as expected by CATALYST 
+rowData(sce)$antigen <- rowData(sce)$target
+
+clustering_markers <- c("DNA1")
+all_markers <- rownames(rowData(sce))
+clustering_cols <- match(clustering_markers,all_markers)
+marker_class <- rep("state", length(rownames(rowData(sce))))
+marker_class[clustering_cols] <- "type"
+marker_class <- factor(marker_class, levels = c("type", "state"))
+rowData(sce)$marker_class <- marker_class
+
+
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+
+sce_filtered2 <- filterSCE(sce, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+sce_filtered2 <- filterSCE(sce, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+patient_means_pt <- patient_means_pt[,colnames(patient_means_pt) %in% colnames(delta_mean_epi)]
+patient_means_met <- patient_means_met[,colnames(patient_means_met) %in% colnames(delta_mean_epi)]
+
+delta_mean_epi_M <- round(patient_means_met-patient_means_pt,2)
+rownames(delta_mean_epi_M)<- paste(rownames(delta_mean_epi_M), "_tumor",sep = "")
+
+delta_mean_epi<- rbind(delta_mean_epi, delta_mean_epi_M)
+
+PT_means_tumor<- rbind(patient_means_pt,PT_means_tumor)
+Met_means_tumor<- rbind(patient_means_met,Met_means_tumor)
+
+rownames(PT_means_tumor)<- paste(rownames(PT_means_tumor), "_tumor",sep = "")
+rownames(Met_means_tumor)<- paste(rownames(Met_means_tumor), "_tumor",sep = "")
+
+
+```
+
+
+
+### T cells mean delta change
+
+```{r}
+sce_immune$cluster_id <- factor(sce_immune$Tcell_subtype)
+metadata(sce_immune)$cluster_codes <- data.frame(custom = factor(levels(sce_immune$cluster_id)), levels = levels(sce_immune$cluster_id))
+
+sce_filtered1 <- filterSCE(sce_immune, cluster_id !="none")
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_pt <- patient_means_pt[ !(rownames(patient_means_pt) %in% c("MPO","HH3","SMA", "panCK", "FSP1","GLUT1","DNA2","CAIX" ,"CD31_vWF","E/P-Cadherin","DNA1","CD163","cleaved_CP","CD140b","CD44","CD38","Caveolin-1", "HLA-DR","CD15","CD11c","CD68" ,"CXCL12","B2M","CD20")), ] 
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_met <- patient_means_met[ !(rownames(patient_means_met) %in% c("MPO","HH3","SMA", "panCK", "FSP1","GLUT1","DNA2","CAIX" ,"CD31_vWF","E/P-Cadherin","DNA1","CD163","cleaved_CP","CD140b","CD44","CD38","Caveolin-1", "HLA-DR","CD15","CD11c","CD68" ,"CXCL12","B2M","CD20")), ]
+
+
+patient_means_pt <- patient_means_pt[,colnames(patient_means_pt) %in% colnames(patient_means_met)]
+patient_means_met <- patient_means_met[,colnames(patient_means_met) %in% colnames(patient_means_pt)]
+
+delta_mean_T <- round(patient_means_met-patient_means_pt,2)
+rownames(delta_mean_T)<- paste(rownames(delta_mean_T), "_Tcell",sep = "")
+
+rownames(patient_means_pt)<- paste(rownames(patient_means_pt), "_Tcell",sep = "")
+rownames(patient_means_met)<- paste(rownames(patient_means_met), "_Tcell",sep = "")
+
+PT_means_immune<- patient_means_pt
+Met_means_immune<- patient_means_met
+
+
+
+```
+
+### Myeloid mean delta change
+
+```{r}
+sce_filtered1 <- filterSCE(sce_mac, cluster_id !="none")
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_pt <- patient_means_pt[ !(rownames(patient_means_pt) %in% c("HH3","CD20","cleaved_CP","SMA","DNA1","panCK","DNA2","GLUT1" ,"CD31_vWF","E/P-Cadherin","DNA1","Ki-67", "CD3","CD45","CD4","VEGF","CD31_vWF","CD8a","E/P-Cadherin","CAIX", "CCR2")), ] 
+
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+patient_means_met <- patient_means_met[ !(rownames(patient_means_met) %in% c("HH3","CD20","cleaved_CP","SMA","DNA1","panCK","DNA2","GLUT1" ,"CD31_vWF","E/P-Cadherin","DNA1","Ki-67", "CD3","CD45","CD4","VEGF","CD31_vWF","CD8a","E/P-Cadherin","CAIX","CCR2")), ]
+
+
+patient_means_pt <- patient_means_pt[,colnames(patient_means_pt) %in% colnames(patient_means_met)]
+patient_means_met <- patient_means_met[,colnames(patient_means_met) %in% colnames(patient_means_pt)]
+
+delta_mean_M <- round(patient_means_met-patient_means_pt,2)
+rownames(delta_mean_M)<- paste(rownames(delta_mean_M), "_Myeloid",sep = "")
+
+rownames(patient_means_pt)<- paste(rownames(patient_means_pt), "_Myeloid",sep = "")
+rownames(patient_means_met)<- paste(rownames(patient_means_met), "_Myeloid",sep = "")
+
+PT_means_myeloid<- patient_means_pt
+Met_means_myeloid<- patient_means_met
+
+```
+
+
+
+### Combine epithelial and t cell change
+```{r}
+delta_mean_epi <- delta_mean_epi[,colnames(delta_mean_epi) %in% colnames(delta_mean_T)]
+delta_mean_T <- delta_mean_T[,colnames(delta_mean_T) %in% colnames(delta_mean_epi)]
+
+delta_combined <- t(rbind(delta_mean_epi,delta_mean_T))
+
+delta_mean_M <- delta_mean_M[,colnames(delta_mean_M) %in% rownames(delta_combined)]
+delta_mean_M<- t(delta_mean_M)
+delta_combined <- delta_combined[rownames(delta_combined) %in% rownames(delta_mean_M),]
+
+delta_combined <- cbind(delta_combined,delta_mean_M)
+
+
+PT_means_tumor <- PT_means_tumor[,colnames(PT_means_tumor) %in% rownames(delta_combined)]
+Met_means_tumor <- Met_means_tumor[,colnames(Met_means_tumor) %in% rownames(delta_combined)]
+
+PT_means_immune <- PT_means_immune[,colnames(PT_means_immune) %in% rownames(delta_combined)]
+Met_means_immune <- Met_means_immune[,colnames(Met_means_immune) %in% rownames(delta_combined)]
+
+PT_means_myeloid <- PT_means_myeloid[,colnames(PT_means_myeloid) %in% rownames(delta_combined)]
+Met_means_myeloid <- Met_means_myeloid[,colnames(Met_means_myeloid) %in% rownames(delta_combined)]
+
+
+mean_expression <- rbind(PT_means_tumor,PT_means_immune)
+mean_expression_PT <- rbind(mean_expression,PT_means_myeloid)
+mean_expression_PT <- as.data.frame.matrix(t(mean_expression_PT))
+
+mean_expression <- rbind(Met_means_tumor,Met_means_immune)
+mean_expression_Met <- rbind(mean_expression,Met_means_myeloid)
+mean_expression_Met <- as.data.frame.matrix(t(mean_expression_Met))
+
+
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+mean_expression_PT$Site.of.Metastasis <- immune_pheno$Site.of.metastasis[match(rownames(mean_expression_PT), immune_pheno$Patient.ID)]
+mean_expression_Met$Site.of.Metastasis <- immune_pheno$Site.of.metastasis[match(rownames(mean_expression_Met), immune_pheno$Patient.ID)]
+
+
+mean_expression_PT$Age.delta<- immune_pheno$Age.delta[match(rownames(mean_expression_PT), immune_pheno$Patient.ID)]
+mean_expression_Met$Age.delta <- immune_pheno$Age.delta[match(rownames(mean_expression_Met), immune_pheno$Patient.ID)]
+
+```
+
+### Correlation plot accorss markers
+```{r correlation-plot-mean-marker-change}
+m <- corr.test(x=delta_combined, y = NULL, use = "pairwise",method="pearson",adjust="BH", alpha=.05,ci=TRUE,minlength=5)
+m_corr <- m$p.adj
+m_corr <- round(m_corr,4)
+
+m_p_adjust <-cbind(m_corr, matrix(data=0, ncol=5, nrow=72))
+
+ggcorrplot::ggcorrplot(m_corr, p.mat = m_p_adjust, hc.order = TRUE, lab = FALSE, insig = "blank",outline.col = "gray",tl.cex = 12,tl.srt = 90,colors = c("#6D9EC1","white" ,"#e44c26"), title = "")
+
+
+```
+
+
+
+### Tumor apoptotic cells and T cell infiltration
+
+```{r}
+
+ggscatter(mean_expression_PT, x = "cleaved_CP_tumor" , y = "LAG-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_PT, x = "cleaved_CP_tumor" , y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+ggscatter(mean_expression_PT, x = "cleaved_CP_tumor" , y = "CD279_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_PT, x = "cleaved_CP_tumor" , y = "Granzyme_B_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+```
+
+### MHC I on tumor cells and exhausted T cells
+
+```{r}
+
+ggscatter(mean_expression_PT, x = "B2M_tumor" , y = "LAG-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_Met, x = "B2M_tumor" , y = "LAG-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_PT, x = "B2M_tumor" , y = "Granzyme_B_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+```
+
+### AR on tumor cells and exhausted t cells
+
+```{r}
+
+ggscatter(mean_expression_PT, x = "AR_tumor" , y = "LAG-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+ggscatter(mean_expression_Met, x = "AR_tumor" , y = "LAG-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_Met, x = "AR_tumor" , y = "Granzyme_B_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+ggscatter(mean_expression_Met, x = "AR_tumor" , y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+```
+
+### Myeloid markers and exhausted T cells
+
+```{r}
+ggscatter(mean_expression_PT, x = "CD38_Myeloid", y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+ggscatter(mean_expression_Met, x = "CD38_Myeloid", y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+
+
+ggscatter(mean_expression_PT, x = "MMP9_Myeloid" , y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+
+ggscatter(mean_expression_Met, x = "MMP9_Myeloid" , y = "Tim-3_Tcell",color = "Site.of.Metastasis",palette = c("#FF8000", "#AC16AC", "#FF3333", "#4C9900",  "#CCCC00"),
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "black", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )+ stat_cor(method = "pearson", size =6) #, label.x = 3, label.y = 30)
+ 
+```
+
+
+### Expression level per tissue type
+```{r}
+
+mean_expression_Met %>% ggplot( aes(x=Site.of.Metastasis, y=`Tim-3_Tcell`)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 70, by = 0.1),1)) +
+    geom_jitter(color="darkgrey", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=18),text = element_text(size=18)) + xlab("")
+
+vars <- c( 'Site.of.Metastasis','Tim-3_Tcell')
+my_dat <- mean_expression_Met[vars]
+rownames(my_dat) <- mean_expression_Met$Patient.ID
+kruskal.test(`Tim-3_Tcell` ~ Site.of.Metastasis, data = my_dat)
+
+mean_expression_Met %>% ggplot( aes(x=Site.of.Metastasis, y=`LAG-3_Tcell`)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 70, by = 0.1),1)) +
+    geom_jitter(color="darkgrey", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=18),text = element_text(size=18)) + xlab("")
+
+vars <- c( 'Site.of.Metastasis','LAG-3_Tcell')
+my_dat <- mean_expression_Met[vars]
+rownames(my_dat) <- mean_expression_Met$Patient.ID
+kruskal.test(`LAG-3_Tcell` ~ Site.of.Metastasis, data = my_dat)
+
+
+mean_expression_Met %>% ggplot( aes(x=Site.of.Metastasis, y=CD279_Tcell)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 70, by = 0.1),1)) +
+    geom_jitter(color="darkgrey", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=18),text = element_text(size=18)) + xlab("")
+
+vars <- c( 'Site.of.Metastasis','CD279_Tcell')
+my_dat <- mean_expression_Met[vars]
+rownames(my_dat) <- mean_expression_Met$Patient.ID
+kruskal.test(CD279_Tcell ~ Site.of.Metastasis, data = my_dat)
+
+
+mean_expression_Met %>% ggplot( aes(x=Site.of.Metastasis, y=FOXP3_Tcell)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 70, by = 0.1),1)) +
+    geom_jitter(color="darkgrey", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=18),text = element_text(size=18)) + xlab("")
+
+vars <- c( 'Site.of.Metastasis','FOXP3_Tcell')
+my_dat <- mean_expression_Met[vars]
+rownames(my_dat) <- mean_expression_Met$Patient.ID
+kruskal.test(FOXP3_Tcell ~ Site.of.Metastasis, data = my_dat)
+```
+  
+### Proportion of exhasuted t cells
+```{r}
+sce_immune$cluster_id <- factor(sce_immune$Tcell_subtype)
+metadata(sce_immune)$cluster_codes <- data.frame(custom = factor(levels(sce_immune$cluster_id)), levels = levels(sce_immune$cluster_id))
+sce_filtered1 <- filterSCE(sce_immune, cluster_id !="none")
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "PT")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+ 
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+y_met = t(fq_per_patient_met)
+tbl_counts_PT <- prop.table(y_met, 1)
+
+sce_filtered2 <- filterSCE(sce_filtered1, sample_type == "M")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+y_met = t(fq_per_patient_met)
+tbl_counts_Met <- prop.table(y_met, 1)
+
+
+df_pt <- data.frame(tbl_counts_PT[,"CD8_exhausted"])
+df_met <- data.frame(tbl_counts_Met[,"CD8_exhausted"])
+
+df_pt$Patient.ID <- rownames(df_pt)
+df_met$Patient.ID <- rownames(df_met)
+
+df_pt <- df_pt[rownames(df_pt) %in% rownames(delta_combined),]
+df_met <- df_met[rownames(df_met) %in% rownames(delta_combined),]
+
+df_pt <- df_pt[match(rownames(delta_combined), df_pt$Patient.ID),]
+colnames(df_pt) <- c("proportionPT", "Patient.ID")
+df_pt$Patient.ID <- factor(df_pt$Patient.ID)
+
+df_met <- df_met[match(rownames(delta_combined), df_met$Patient.ID),]
+colnames(df_met) <- c("proportionMet", "Patient.ID")
+df_met$Patient.ID <- factor(df_met$Patient.ID)
+
+df_met$Patient.ID <- NULL
+united <- cbind(df_pt, df_met)
+```
+
+# Intratumoral region only
+```{r grade-exhausted-tcell-proportions}
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+exhausted_prop <- united
+exhausted_prop$var <- factor(immune_pheno$Site.of.metastasis[match(exhausted_prop$Patient.ID, immune_pheno$Patient.ID)])
+
+
+exhausted_prop %>% ggplot( aes(x=var, y=proportionMet)) +
+    geom_boxplot(outlier.shape = NA, ) + scale_y_continuous(breaks = round(seq(0, 0.2, by = 0.005),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=10),text = element_text(size=8)
+    ) +
+    xlab("") + ylab("Abundance (0-1)")
+
+```
+
+
+

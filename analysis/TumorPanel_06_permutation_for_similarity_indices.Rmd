@@ -1,0 +1,1042 @@
+---
+title: "TumorPanel_06_permutation_for_similarity_indices"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+## Introduction
+
+This script calculates ecological diversity measures for different clustering type as in the R file TumorPanel_ecological_diversity_indices_calculations but additionally does a random permutation analysis.
+For random permutation the patient labels are shuffled among primary tumors and separately for metastatic sites and then for each matched pair a distance measure is calculated.For significance testing, the median distance across the whole cohort after every permutation step is calculated to get a distribution of median distances. Then the real cohort median distance value is compared to the randomly permuted median distances.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(compositions)
+library(vegan)
+library(ComplexHeatmap)
+
+#setwd("projects/BCmet/workflowr_publication/BCmet_pub")
+# Read SingleCellExperiment object
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1","Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7", 
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1")
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce1 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+#filter only patients with matched samples
+sce2 <-filterSCE(sce1, matched_samples==1)
+#Check number of cells per patient sample:
+counts_per_sample <- table(sce2$sample_type, sce2$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<200)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+unique(sce2$Site.of.metastasis[sce2$Patient.ID %in% patient_to_exclude])
+
+sce <- filterSCE(sce2, !(sce2$Patient.ID %in% patient_to_exclude))
+
+#Repeat tissue type as condition for plotting functions in CATALYST
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$condition <- factor(sce$Tissue.Type)
+sce$Patient.ID <- factor(sce$Patient.ID)
+sce$Location <- factor(sce$Location)
+
+colSums(table(sce$Patient.ID,sce$Site.of.metastasis)!=0)
+colSums(table(sce$Patient.ID,sce$Tissue.Type)!=0)
+colSums(table(sce$Patient.ID,sce$molecular.subtype)!=0)
+```
+
+
+### Aitchison distance for main flowSOM-20 clusters
+
+
+```{r fsom}
+
+#big flowSOM clusters
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+x_log_pt <- f-rowMeans(f) #need later
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+y_log_met <- f-rowMeans(f) #need later
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+x = round(x*100,1)
+x[x<1] <- 0
+y = round(y*100,1)
+y[y<1] <- 0
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+
+diversity_metadata_2 <-diversity_metadata
+
+### random permutation part 
+
+diversity_metadata_random_Aitchison<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_Manhattan<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_jaccard<-diversity_metadata[,0,drop=FALSE]
+
+
+for (zz in 1:1000) {
+  
+        diversity_metadata_random_Aitchison[,zz]<-0
+        diversity_metadata_random_Manhattan[,zz]<-0
+        diversity_metadata_random_jaccard[,zz]<-0
+        
+        x <- x_log_pt[,sample(ncol(x_log_pt))]
+        colnames(x) <- colnames( x_log_pt)
+        
+        y <-y_log_met[,sample(ncol(y_log_met))]
+        colnames(y) <- colnames(y_log_met)
+        
+        abundances_per_patient_PT_r <- abundances_per_patient_PT[,sample(ncol(abundances_per_patient_PT))]
+        colnames(abundances_per_patient_PT_r) <- colnames(abundances_per_patient_PT)
+        
+        abundances_per_patient_met_r <- abundances_per_patient_met[,sample(ncol(abundances_per_patient_met))]
+        colnames(abundances_per_patient_met_r) <- colnames(abundances_per_patient_met)
+        
+  
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Aitchison[rownames(diversity_metadata_random_Aitchison) == patientID,zz] <-jc
+         
+        }
+        
+        x = t(abundances_per_patient_PT_r)
+        y = t(abundances_per_patient_met_r)
+        
+        x = round(x*100,1)
+        x[x<1] <- 0
+        y = round(y*100,1)
+        y[y<1] <- 0
+
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Manhattan[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         if(any(is.na(abundances))){
+           diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-NA
+         }else{
+         jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+         diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         }
+        }
+}
+
+```
+
+
+### For Aitchison distance plot distribution of real mean and permuted mean and median similairty comparison for the whole cohort
+
+```{r Aitchison-permutation-fsom20}
+x_obs <- diversity_metadata_2$L2_transformed
+y_sim <- diversity_metadata_random_Aitchison
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance)) ###
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE)) ###
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =",sum(means<=real_mean$mean)/length(means))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_histogram(aes(y=..density..), position="identity", alpha=0.5)+ 
+  scale_color_grey()+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean, color=type),
+             linetype="dashed")+theme(legend.position="top")
+
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=20, y=1, label=sig,
+              color="red")
+
+
+```
+
+### Manhattan for main flowSOM-20 clusters
+
+```{r bray-curtis-permutation-fsome20}
+
+x_obs <- diversity_metadata_2$L1_proportions
+y_sim <- diversity_metadata_random_Manhattan
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+```
+
+### Jaccard for main flowSOM-20 clusters
+
+```{r jaccard-permutation-fsom20}
+
+x_obs <- diversity_metadata_2$jaccard
+y_sim <- diversity_metadata_random_jaccard
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance)) ###
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))###
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+```
+
+
+
+
+### Same for other clustering types
+
+# k means
+
+```{r kmeans_clusters}
+
+#big flowSOM clusters
+sce$cluster_id <- sce$kmeans_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+x_log_pt <- f-rowMeans(f) #need later
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+y_log_met <- f-rowMeans(f) #need later
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+x = round(x*100,1)
+x[x<1] <- 0
+y = round(y*100,1)
+y[y<1] <- 0
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+
+diversity_metadata_2 <-diversity_metadata
+
+### random permutation part 
+
+diversity_metadata_random_Aitchison<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_Manhattan<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_jaccard<-diversity_metadata[,0,drop=FALSE]
+
+
+for (zz in 1:10000) {
+  
+        diversity_metadata_random_Aitchison[,zz]<-0
+        diversity_metadata_random_Manhattan[,zz]<-0
+        diversity_metadata_random_jaccard[,zz]<-0
+        
+        x <- x_log_pt[,sample(ncol(x_log_pt))]
+        colnames(x) <- colnames( x_log_pt)
+        
+        y <-y_log_met[,sample(ncol(y_log_met))]
+        colnames(y) <- colnames(y_log_met)
+        
+        abundances_per_patient_PT_r <- abundances_per_patient_PT[,sample(ncol(abundances_per_patient_PT))]
+        colnames(abundances_per_patient_PT_r) <- colnames(abundances_per_patient_PT)
+        
+        abundances_per_patient_met_r <- abundances_per_patient_met[,sample(ncol(abundances_per_patient_met))]
+        colnames(abundances_per_patient_met_r) <- colnames(abundances_per_patient_met)
+        
+  
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Aitchison[rownames(diversity_metadata_random_Aitchison) == patientID,zz] <-jc
+         
+        }
+        
+        x = t(abundances_per_patient_PT_r)
+        y = t(abundances_per_patient_met_r)
+        x = round(x*100,1)
+        x[x<1] <- 0
+        y = round(y*100,1)
+        y[y<1] <- 0
+        
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Manhattan[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         if(any(is.na(abundances))){
+           diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-NA
+         }else{
+         jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+         diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         }
+        }
+}
+
+```
+
+
+###  Aitchison distance
+
+```{r Aitchison-permutation-km}
+
+x_obs <- diversity_metadata_2$L2_transformed
+y_sim <- diversity_metadata_random_Aitchison
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=70, y=1, label=sig,
+              color="red")
+
+
+```
+
+### Manhattan
+
+```{r bray-curtis-permutation-km}
+
+x_obs <- diversity_metadata_2$L1_proportions
+y_sim <- diversity_metadata_random_Manhattan
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+
+
+```
+
+### Jaccard
+
+```{r jaccard-permutation-km}
+
+x_obs <- diversity_metadata_2$jaccard
+y_sim <- diversity_metadata_random_jaccard
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+
+```
+
+
+
+# grpah based clustering
+
+
+
+```{r graph-based}
+
+#big flowSOM clusters
+sce$cluster_id <- sce$epithelial_phenograph_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+x_log_pt <- f-rowMeans(f) #need later
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+y_log_met <- f-rowMeans(f) #need later
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+x = round(x*100,1)
+x[x<1] <- 0
+y = round(y*100,1)
+y[y<1] <- 0
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+
+diversity_metadata_2 <-diversity_metadata
+
+### random permutation part 
+
+diversity_metadata_random_Aitchison<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_Manhattan<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_jaccard<-diversity_metadata[,0,drop=FALSE]
+
+
+for (zz in 1:10000) {
+  
+        diversity_metadata_random_Aitchison[,zz]<-0
+        diversity_metadata_random_Manhattan[,zz]<-0
+        diversity_metadata_random_jaccard[,zz]<-0
+        
+        x <- x_log_pt[,sample(ncol(x_log_pt))]
+        colnames(x) <- colnames( x_log_pt)
+        
+        y <-y_log_met[,sample(ncol(y_log_met))]
+        colnames(y) <- colnames(y_log_met)
+        
+        abundances_per_patient_PT_r <- abundances_per_patient_PT[,sample(ncol(abundances_per_patient_PT))]
+        colnames(abundances_per_patient_PT_r) <- colnames(abundances_per_patient_PT)
+        
+        abundances_per_patient_met_r <- abundances_per_patient_met[,sample(ncol(abundances_per_patient_met))]
+        colnames(abundances_per_patient_met_r) <- colnames(abundances_per_patient_met)
+        
+  
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Aitchison[rownames(diversity_metadata_random_Aitchison) == patientID,zz] <-jc
+         
+        }
+        
+        x = t(abundances_per_patient_PT_r)
+        y = t(abundances_per_patient_met_r)
+        
+        x = round(x*100,1)
+        x[x<1] <- 0
+        y = round(y*100,1)
+        y[y<1] <- 0
+        
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Manhattan[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         if(any(is.na(abundances))){
+           diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-NA
+         }else{
+         jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+         diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         }
+        }
+}
+
+```
+
+
+### Aitchison distance
+
+```{r Aitchison-permutation-gb}
+
+x_obs <- diversity_metadata_2$L2_transformed
+y_sim <- diversity_metadata_random_Aitchison
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=70, y=1, label=sig,
+              color="red")
+
+```
+
+### Manhattan
+
+```{r bray-curtis-permutation-gb}
+
+x_obs <- diversity_metadata_2$L1_proportions
+y_sim <- diversity_metadata_random_Manhattan
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+
+
+```
+
+### Jaccard
+
+```{r jaccard-permutation-gb}
+
+x_obs <- diversity_metadata_2$jaccard
+y_sim <- diversity_metadata_random_jaccard
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+
+```
+
+
+
+# fsom-45
+
+
+```{r fsom-45}
+
+#big flowSOM clusters
+sce$cluster_id <- sce$flowSOM_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+diversity_metadata <- diversity_metadata[diversity_metadata$Patient.ID %in% sce$Patient.ID,]
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_met[,colSums(fq_per_patient_met, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+fq_per_patient_met[abundances_per_patient_met == 'NA']<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+fq_per_patient_pt[,colSums(fq_per_patient_pt, na.rm = TRUE) == 0]<- NA
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+fq_per_patient_pt[abundances_per_patient_PT == 'NA']<- NA
+
+
+x_pt = t(fq_per_patient_pt)
+y_met = t(fq_per_patient_met)
+
+f <- log(prop.table(x_pt + 1, 1), 2)
+x <- f-rowMeans(f)
+x_log_pt <- f-rowMeans(f) #need later
+f <- log(prop.table(y_met + 1, 1), 2)
+y <- f-rowMeans(f)
+y_log_met <- f-rowMeans(f) #need later
+
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L2_transformed[diversity_metadata$Patient.ID == patientID] <-jc
+ 
+}
+
+x = t(abundances_per_patient_PT)
+y = t(abundances_per_patient_met)
+
+x = round(x*100,1)
+x[x<1] <- 0
+y = round(y*100,1)
+y[y<1] <- 0
+
+for(i in 1:nrow(x)){
+ patientID <-rownames(x)[i]
+ abundances <- rbind( x[patientID,], y[patientID,])
+ jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+ diversity_metadata$L1_proportions[diversity_metadata$Patient.ID == patientID] <-jc
+ if(any(is.na(abundances))){
+   diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-NA
+ }else{
+ jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+ diversity_metadata$jaccard[diversity_metadata$Patient.ID == patientID] <-jc
+ diversity_metadata$dice[diversity_metadata$Patient.ID == patientID] <-(2*jc)/(1+jc)
+ }
+}
+
+
+diversity_metadata_2 <-diversity_metadata
+
+### random permutation part 
+
+diversity_metadata_random_Aitchison<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_Manhattan<-diversity_metadata[,0,drop=FALSE]
+diversity_metadata_random_jaccard<-diversity_metadata[,0,drop=FALSE]
+
+
+for (zz in 1:10000) {
+  
+        diversity_metadata_random_Aitchison[,zz]<-0
+        diversity_metadata_random_Manhattan[,zz]<-0
+        diversity_metadata_random_jaccard[,zz]<-0
+        
+        x <- x_log_pt[,sample(ncol(x_log_pt))]
+        colnames(x) <- colnames( x_log_pt)
+        
+        y <-y_log_met[,sample(ncol(y_log_met))]
+        colnames(y) <- colnames(y_log_met)
+        
+        abundances_per_patient_PT_r <- abundances_per_patient_PT[,sample(ncol(abundances_per_patient_PT))]
+        colnames(abundances_per_patient_PT_r) <- colnames(abundances_per_patient_PT)
+        
+        abundances_per_patient_met_r <- abundances_per_patient_met[,sample(ncol(abundances_per_patient_met))]
+        colnames(abundances_per_patient_met_r) <- colnames(abundances_per_patient_met)
+        
+  
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'euclidean', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Aitchison[rownames(diversity_metadata_random_Aitchison) == patientID,zz] <-jc
+         
+        }
+        
+        x = t(abundances_per_patient_PT_r)
+        y = t(abundances_per_patient_met_r)
+        
+        x = round(x*100,1)
+        x[x<1] <- 0
+        y = round(y*100,1)
+        y[y<1] <- 0
+        
+        for(i in 1:nrow(x)){
+         patientID <-rownames(x)[i]
+         abundances <- rbind( x[patientID,], y[patientID,])
+         jc <- vegdist(abundances,method = 'manhattan', binary = FALSE,na.rm = TRUE)
+         diversity_metadata_random_Manhattan[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         if(any(is.na(abundances))){
+           diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-NA
+         }else{
+         jc <- vegdist(abundances,method = 'jaccard', binary = TRUE,na.rm = TRUE)
+         diversity_metadata_random_jaccard[rownames(diversity_metadata_random_Aitchison),zz] <-jc
+         }
+        }
+}
+
+```
+
+
+### Aitchsison distance
+
+```{r Aitchison-permutation-fs45}
+
+x_obs <- diversity_metadata_2$L2_transformed
+y_sim <- diversity_metadata_random_Aitchison
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=70, y=1, label=sig,
+              color="red")
+
+
+```
+
+### Manhattan
+
+```{r bray-curtis-permutation-fs45}
+
+x_obs <- diversity_metadata_2$L1_proportions
+y_sim <- diversity_metadata_random_Manhattan
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+
+```
+
+### Jaccard
+
+```{r jaccard-permutation-fs45}
+
+x_obs <- diversity_metadata_2$jaccard
+y_sim <- diversity_metadata_random_jaccard
+
+
+df_tmp <- reshape2::melt(cbind(y_sim,x_obs))
+df_tmp$type <- "simulation"
+
+df_tmp$type[df_tmp$variable == "x_obs"] <- "observed"
+colnames(df_tmp) <- c("variable", "distance", "type")
+mu <- plyr::ddply(df_tmp, "type", summarise, grp.mean=median(distance))
+
+
+real_mean <- data.frame(median(x_obs, na.rm = TRUE))
+colnames(real_mean)<- "mean"
+means <- colMedians(as.matrix(y_sim))
+sig <-paste("p =", round(sum(means<=real_mean$mean)/length(means),3))
+
+
+ggplot(df_tmp,aes(x=distance, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+means <- as.data.frame(means)
+colnames(means)<-"median_similarity"
+ggplot(means,aes(x=median_similarity,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(data=mu, aes(xintercept=grp.mean[1], color=type[1]),
+             linetype="dashed")+theme(legend.position="top")+annotate(geom="text", x=0.7, y=1, label=sig,
+              color="red")
+```
+
+

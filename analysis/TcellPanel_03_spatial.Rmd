@@ -1,0 +1,560 @@
+---
+title: "TcellPanel_03_spatial"
+author: "SandraTietscher"
+date: "2021-12-07"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(dittoSeq)
+library(cowplot)
+library(scran)
+library(edgeR)
+library(CATALYST)
+library(cytomapper)
+library(vegan)
+library(pairwiseAdonis)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(ggrepel)
+library(cytomapper)
+
+# Read SingleCellExperiment object with subclustered T cells and subset T cells only
+sce_full <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce <- sce_full[,which(sce_full$Tcell_subtype != "none")]
+```
+
+# Compare phenotype proportions in intratumoral, stromal-enriched and margin regions of PT
+
+```{r prepare-SCE-PT}
+sce_PT <- filterSCE(sce, Tissue.Type == "PT")
+sce_PT$patientLocation <- paste(sce_PT$Patient.ID, sce_PT$Location, sep = "_")
+```
+
+Use CATALYST's clrDR function to compute centered log-ratios on cluster proportions and visualize them in a lower-dimensional space (PCA).
+
+```{r catalyst-clrDR-samples}
+sce_PT$sample_id <- factor(sce_PT$patientLocation)
+sce_PT$cluster_id <- sce_PT$Tcell_subtype
+sce_PT$condition <- factor(sce_PT$Location)
+metadata(sce_PT)$cluster_codes <- data.frame(Tcell_subtype = factor(sce_PT$Tcell_subtype))
+
+clrDR(sce_PT, dr = "PCA", by = "sample_id", k = "Tcell_subtype", point_pal = metadata(sce)$colour_vectors$Location)
+```
+
+Permanova (Permutational Multivariate Analysis of Variance) on distance matrices to test whether the centroids of the T cell phenotypic composition differs significantly across different locations. Aitchisons distance was chosen to calculate distance matrices
+
+```{r permanova-location}
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+patientLocation_tbl <- prop.table(table(sce_PT$patientLocation, sce_PT$cluster_id) + 0.00001, margin = 1)
+patientLocation_clr <- compositions::clr(patientLocation_tbl)
+dist <- vegdist(patientLocation_clr, method = "euclidean")
+
+metadata <- data.frame(patient = sapply(strsplit(rownames(patientLocation_tbl), "_"), "[[", 1),
+                       location = sapply(strsplit(rownames(patientLocation_tbl), "_"), "[[", 2))
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$location, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 999)
+
+# Permanova test (overall and pairwise)
+adonis(dist ~location,  data=metadata, permutations=9999)
+pairwise.adonis(dist,metadata$location,p.adjust.m= 'BH')
+```
+
+Differential abundance by location (reference: margin regions)
+
+```{r DA-location}
+abundances <- table(sce_PT$Tcell_subtype, sce_PT$patientLocation) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "margin" is the baseline group
+meta <- colData(sce_PT)[match(colnames(abundances), sce_PT$patientLocation),]
+location <- factor(meta$Location)
+meta$location <- relevel(x=location, ref = "margin")
+y.ab <- DGEList(abundances, samples=meta, group = meta$location)
+design <- model.matrix(~Patient.ID + location, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Plot
+
+## Stromal vs margin
+  res <- glmQLFTest(fit.ab, coef="locationstromal")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 15)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort by logFC
+  order <- rownames(DA[order(DA$logFC),])
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Stromal vs margin"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+## Intratumoral vs margin
+res <- glmQLFTest(fit.ab, coef="locationintratumoral")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 15)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Intratumoral vs margin"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+
+# Compare phenotype proportions in samples that are clinically classified as "hot" vs "cold"
+
+```{r read-patho}
+# Load csv with pathologist-annotated immune phenotype information
+patho <- read.csv("data/immune_phenotypes_pathology_encoded.csv")
+```
+
+For PTs only - differential abundance testing using EdgeR.
+
+```{r DA-hotcold-PT}
+sce_PT$infiltration <- patho$Immune.phenotype.PT[match(sce_PT$Patient.ID, patho$Patient.ID)]
+
+# Differential abundance testing
+abundances <- table(sce_PT$Tcell_subtype, sce_PT$Patient.ID) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "inflamed" is the baseline group
+meta <- colData(sce_PT)[match(colnames(abundances), sce_PT$Patient.ID),]
+infiltration <- factor(meta$infiltration)
+meta$infiltration <- relevel(x=infiltration, ref = "inflamed")
+y.ab <- DGEList(abundances, samples=meta, group = meta$infiltration)
+design <- model.matrix(~infiltration, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance
+res <- glmQLFTest(fit.ab)
+summary(decideTests(res))
+DA <- topTags(res, n= nrow(abundances))$table
+DA$subtype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+DA <- DA[order(DA$logFC),]
+DA$subtype <- factor(DA$subtype, levels = DA$subtype)
+
+# Plot
+ggplot(DA, aes(subtype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y="Excluded vs inflamed", x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For PTs and Met together - differential abundance testing using EdgeR.
+
+```{r DA-hotcold-all}
+sce$patient.site <- paste(sce$Patient.ID, ifelse(sce$Tissue.Type == "PT", "PT", "Met"), sep = "_")
+
+# Clean up pathology table
+patho1 <- patho[patho$Patient.ID != "ID17",] # Exclude the one patient whose metastatic sites have different annotations
+patho_short <- patho1[,c(1,3,4)]
+colnames(patho_short) <- c("Patient.ID", "PT", "Met")
+patho_short <- pivot_longer(patho_short, 2:3, names_to = "site", values_to = "infiltration")
+patho_short$patient.site <- paste(patho_short$Patient.ID, patho_short$site, sep = "_")
+
+# Exclude patients not present in the pathology list
+sce <- sce[,which(sce$Patient.ID %in% patho1$Patient.ID)]
+sce$infiltration <- patho_short$infiltration[match(sce$patient.site, patho_short$patient.site)]
+
+# Covert to binary characteristic (hot/cold)
+sce$infiltration <- ifelse(sce$infiltration == "inflamed", "hot", "cold")
+
+# Differential abundance testing
+abundances <- table(sce$Tcell_subtype, sce$patient.site) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "hot" is the baseline group
+meta <- colData(sce)[match(colnames(abundances), sce$patient.site),]
+infiltration <- factor(meta$infiltration)
+meta$infiltration <- relevel(x=infiltration, ref = "hot")
+y.ab <- DGEList(abundances, samples=meta, group = meta$infiltration)
+design <- model.matrix(~infiltration, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance
+res <- glmQLFTest(fit.ab)
+summary(decideTests(res))
+DA <- topTags(res, n= nrow(abundances))$table
+DA$subtype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+DA <- DA[order(DA$logFC),]
+DA$subtype <- factor(DA$subtype, levels = DA$subtype)
+
+# Plot
+ggplot(DA, aes(subtype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y="cold vs hot", x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+Met only - differential abundance testing using EdgeR.
+
+```{r DA-hotcold-met}
+sce_Met <- sce[,which(sce$Tissue.Type != "PT")]
+
+# Differential abundance testing
+abundances <- table(sce_Met$Tcell_subtype, sce_Met$patient.site) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "hot" is the baseline group
+meta <- colData(sce)[match(colnames(abundances), sce_Met$patient.site),]
+infiltration <- factor(meta$infiltration)
+meta$infiltration <- relevel(x=infiltration, ref = "hot")
+y.ab <- DGEList(abundances, samples=meta, group = meta$infiltration)
+design <- model.matrix(~infiltration, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance
+res <- glmQLFTest(fit.ab)
+summary(decideTests(res))
+DA <- topTags(res, n= nrow(abundances))$table
+DA$subtype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+DA <- DA[order(DA$logFC),]
+DA$subtype <- factor(DA$subtype, levels = DA$subtype)
+
+# Plot
+ggplot(DA, aes(subtype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y="cold vs hot", x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+# Analyse spatial distribution of T cell phenotypes in relation to tumor/stroma border
+
+```{r border-distance-prep}
+# Read in file with tumor/stroma mask information
+tsmask <- read.csv("data/final_distanceTumorStroma_Cells_Tcell.csv")
+
+# Read in file for bone images (was trained separately due to bad training quality)
+tsmask_bone <- read.csv("data/Tcell_distanceTumorStroma_BONE_only_Cells.csv")
+
+```
+
+### Merge information about tumor/stroma border distance into main object
+
+In some images, all cells have the value 65535 (max uint16 value). These are images where no tumor/stroma edge was identified, so no distances could be calculated. Exclude these for all mask-based analysis.
+
+```{r merge-into-sce}
+tsmask$ImageObjectNr <- paste(tsmask$ImageNumber, tsmask$ObjectNumber, sep="_")
+
+# Match Object Number (via file name)
+tsmask_bone$file <- paste0(tsmask_bone$Metadata_acname, "_a", tsmask_bone$Metadata_acid, "_ac_full.tiff")
+tsmask_bone$ImageNumber <- sce$ImageNumber[match(tsmask_bone$file, sce$file)]
+tsmask_bone$ImageObjectNr <- paste(tsmask_bone$ImageNumber, tsmask_bone$ObjectNumber, sep="_")
+sce$ImageObjectNr <- paste(sce$ImageNumber, sce$CellNumber, sep="_")
+
+# remove bone image cells from tsmask object
+bone_img <- tsmask_bone$ImageObjectNr
+tsmask <- filter(tsmask, !(ImageObjectNr %in% bone_img))
+
+col_keep <- c("ImageObjectNr", "Intensity_MeanIntensity_TumourMask_Distance_B100", "Intensity_MinIntensityEdge_TumourMask_Distance_B100", "Intensity_MaxIntensityEdge_TumourMask_Distance_B100")
+tsmask <- rbind(tsmask[,col_keep], tsmask_bone[,col_keep])
+
+
+# Add mean, minimum and maximum border distances to object
+sce$meanBorderDistance <- tsmask$Intensity_MeanIntensity_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+sce$minBorderDistance <- tsmask$Intensity_MinIntensityEdge_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+sce$maxBorderDistance <- tsmask$Intensity_MaxIntensityEdge_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+
+# Set 65535 to NA
+sce$meanBorderDistance <- ifelse(sce$meanBorderDistance == 65535, NA, sce$meanBorderDistance)
+sce$minBorderDistance <- ifelse(sce$minBorderDistance == 65535, NA, sce$minBorderDistance)
+sce$maxBorderDistance <- ifelse(sce$maxBorderDistance == 65535, NA, sce$maxBorderDistance)
+
+# Assign binary mask status
+sce$mask_bin <- ifelse(sce$meanBorderDistance > 0, "tumor", "stroma")
+
+# Assign mask status where cells whose meanDistance is negative (outside tumor mask) but whose maxDistance is positive (inside tumor mask) are classified as "edge"
+sce$mask <- ifelse(sce$meanBorderDistance > 0, "tumor", ifelse(sce$maxBorderDistance > 0, "edge", "stroma"))
+
+# Subset cells (images) with no NAs
+sce_sub <- sce[,which(!(is.na(sce$meanBorderDistance)))]
+```
+
+Add mask information to full object (for cytomapper plotting)
+
+```{r add-mask-full-object}
+sce_full$ImageObjectNr <- paste(sce_full$ImageNumber, sce_full$CellNumber, sep="_")
+
+# Add mean, minimum and maximum border distances to object
+sce_full$meanBorderDistance <- tsmask$Intensity_MeanIntensity_TumourMask_Distance_B100[match(sce_full$ImageObjectNr, tsmask$ImageObjectNr)]
+sce_full$minBorderDistance <- tsmask$Intensity_MinIntensityEdge_TumourMask_Distance_B100[match(sce_full$ImageObjectNr, tsmask$ImageObjectNr)]
+sce_full$maxBorderDistance <- tsmask$Intensity_MaxIntensityEdge_TumourMask_Distance_B100[match(sce_full$ImageObjectNr, tsmask$ImageObjectNr)] 
+
+# Set 65535 to NA
+sce_full$meanBorderDistance <- ifelse(sce_full$meanBorderDistance == 65535, NA, sce_full$meanBorderDistance)
+sce_full$minBorderDistance <- ifelse(sce_full$minBorderDistance == 65535, NA, sce_full$minBorderDistance)
+sce_full$maxBorderDistance <- ifelse(sce_full$maxBorderDistance == 65535, NA, sce_full$maxBorderDistance)
+
+# Assign binary mask status
+sce_full$mask_bin <- ifelse(sce_full$meanBorderDistance > 0, "tumor", "stroma")
+
+# Assign mask status where cells whose meanDistance is negative (outside tumor mask) but whose maxDistance is positive (inside tumor mask) are classified as "edge"
+sce_full$mask <- ifelse(sce_full$meanBorderDistance > 0, "tumor", ifelse(sce_full$maxBorderDistance > 0, "edge", "stroma"))
+
+# Subset cells (images) with no NAs
+sce_sub_full <- sce_full[,which(!(is.na(sce_full$meanBorderDistance)))]
+```
+
+
+### Compare proportions of T cells that are within a tumor mask in PT vs met (intratumoral only)
+
+```{r proportions-tumor-stroma}
+sce_sub$patient_tissue <- paste(sce_sub$Patient.ID, sce_sub$Tissue.Type, sep = "_")
+
+# Subset intratumoral
+sce_intra <- sce_sub[,which(sce_sub$Location == "intratumoral")]
+T_table <- as.data.frame(prop.table(table(sce_intra$patient_tissue, sce_intra$mask), margin = 1))
+T_table <- separate(T_table, Var1, into = c("patient", "tissue"))
+
+## Plot percentage that is within tumor mask
+T_mask <- filter(T_table, Var2 == "tumor")
+my_comparisons <- list( c("Brain", "PT"), c("Bone", "PT"), c("Liver", "PT"), c("SoftTissue", "PT"))
+ggplot(T_mask, aes(tissue, Freq))+
+  geom_boxplot()+
+  ylab("Percentage of T cells cells in tumor mask")+
+  stat_compare_means(method = "anova")+
+  stat_compare_means(comparisons = my_comparisons)
+```
+
+CD8+ T cells only:
+
+```{r CD8-proportions-tumor-stroma}
+sce_intra_CD8 <- sce_intra[,which(sce_intra$clustername == "T_CD8")]
+
+CD8_table <- as.data.frame(prop.table(table(sce_intra_CD8$patient_tissue, sce_intra_CD8$mask), margin = 1))
+CD8_table <- separate(CD8_table, Var1, into = c("patient", "tissue"))
+
+## Plot percentage that is within tumor mask
+CD8_mask <- filter(CD8_table, Var2 == "tumor")
+my_comparisons <- list( c("Brain", "PT"), c("Bone", "PT"), c("Liver", "PT"), c("SoftTissue", "PT"))
+ggplot(CD8_mask, aes(tissue, Freq))+
+  geom_boxplot()+
+  ylab("Percentage of T cells cells in tumor mask")+
+  stat_compare_means(method = "anova")+
+  stat_compare_means(comparisons = my_comparisons)
+
+```
+
+
+### Compare proportions of T cells that are within a tumor mask in hot vs cold
+
+```{r proportions-tumor-stroma-hotcold}
+T_table <- as.data.frame(prop.table(table(sce_sub$patient_tissue, sce_sub$mask), margin = 1))
+T_table$infiltration <- sce_sub$infiltration[match(T_table$Var1, sce_sub$patient_tissue)]
+T_table <- separate(T_table, Var1, into = c("patient", "tissue"))
+
+## Plot percentage that is within tumor mask
+T_mask <- filter(T_table, Var2 == "tumor")
+ggplot(T_mask, aes(infiltration, Freq))+
+  geom_boxplot()+
+  ylab("Percentage of T cells in tumor mask")+
+  stat_compare_means(method = "wilcox")
+
+
+# Subset intratumoral
+sce_intra <- sce_sub[,which(sce_sub$Location == "intratumoral")]
+T_table <- as.data.frame(prop.table(table(sce_intra$patient_tissue, sce_intra$mask), margin = 1))
+T_table$infiltration <- sce_intra$infiltration[match(T_table$Var1, sce_intra$patient_tissue)]
+T_table <- separate(T_table, Var1, into = c("patient", "tissue"))
+
+    ## Only for PT
+    T_mask <- filter(T_table, Var2 == "tumor" & tissue == "PT")
+    ggplot(T_mask, aes(infiltration, Freq))+
+      geom_boxplot()+
+      ylab("Percentage of T cells cells in tumor mask")+
+      stat_compare_means(method = "wilcox")
+
+    ## Only for met
+    T_mask <- filter(T_table, Var2 == "tumor" & tissue != "PT")
+    ggplot(T_mask, aes(infiltration, Freq))+
+      geom_boxplot()+
+      ylab("Percentage of T cells cells in tumor mask")+
+      stat_compare_means(method = "wilcox")
+```
+
+### Enrichment of T cell subtypes within tumor vs stromal masks
+
+Edge regions are classified as tumor regions for this analysis.
+
+```{r Tcell-subtype-enrichment}
+# Everything that is on the edge --> count into tumor mask
+sce_sub$mask <- ifelse(sce_sub$mask == "stroma", "stroma", "tumor")
+
+abundances <- table(sce_sub$Tcell_subtype, sce_sub$mask)
+logEnrichment_tumor <- as.data.frame(log2(abundances[,"tumor"]/abundances[,"stroma"]))
+colnames(logEnrichment_tumor) <- "logEnrichment"
+logEnrichment_tumor$Tcell_subtype <- rownames(logEnrichment_tumor)
+
+#colors
+T_col <- c("#666600", "#003319", "#CCCC00", "#00CC00", "#00FF00", "#B2FF66", "#CCFFCC", "#66FFFF", "#00CCCC", "#3333FF", "#99CCFF")
+names(T_col) <- rownames(abundances)
+
+pos <- position_jitter(width = 0, height = 0.1, seed = 2)
+ggplot(logEnrichment_tumor, aes(logEnrichment, "y")) +
+  geom_jitter(aes(fill = Tcell_subtype), position = pos, shape = 21, size = 3)+
+  scale_fill_manual(values = T_col)+
+  geom_label_repel(aes(label=Tcell_subtype), size = 3, position = pos)+
+  theme(axis.title.y= element_blank(), axis.text.y = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=1), panel.background = element_blank())+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  xlab("Fold-enrichment in tumor mask [log2]")
+
+```
+
+PT only.
+
+```{r mask-subtype-enrichment-PT}
+sce_sub_PT <- sce_sub[,which(sce_sub$Tissue.Type == "PT")]
+
+abundances <- table(sce_sub_PT$Tcell_subtype, sce_sub_PT$mask)
+logEnrichment_tumor <- as.data.frame(log2(abundances[,"tumor"]/abundances[,"stroma"]))
+colnames(logEnrichment_tumor) <- "logEnrichment"
+logEnrichment_tumor$Tcell_subtype <- rownames(logEnrichment_tumor)
+
+ggplot(logEnrichment_tumor, aes(logEnrichment, "y")) +
+  geom_jitter(aes(fill = Tcell_subtype), position = pos, shape = 21, size = 3)+
+  scale_fill_manual(values = T_col)+
+  geom_text_repel(aes(label=Tcell_subtype), size = 3, position = pos)+
+  theme(axis.title.y= element_blank(), axis.text.y = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=1), panel.background = element_blank())+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  xlab("Fold-enrichment in tumor mask [log2]")
+```
+
+Met only.
+
+```{r mask-subtype-enrichment-met}
+sce_sub_met <- sce_sub[,which(sce_sub$Tissue.Type != "PT")]
+
+abundances <- table(sce_sub_met$Tcell_subtype, sce_sub_met$mask)
+logEnrichment_tumor <- as.data.frame(log2(abundances[,"tumor"]/abundances[,"stroma"]))
+colnames(logEnrichment_tumor) <- "logEnrichment"
+logEnrichment_tumor$Tcell_subtype <- rownames(logEnrichment_tumor)
+
+ggplot(logEnrichment_tumor, aes(logEnrichment, "y")) +
+  geom_jitter(aes(fill = Tcell_subtype), position = pos, shape = 21, size = 3)+
+  scale_fill_manual(values = T_col)+
+  geom_text_repel(aes(label=Tcell_subtype), size = 3, position = pos)+
+  theme(axis.title.y= element_blank(), axis.text.y = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=1), panel.background = element_blank())+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  xlab("Fold-enrichment in tumor mask [log2]")
+```
+
+# Cytomapper plotting
+
+```{r}
+path.to.images <- "data/example_Tcell_masks"
+all_masks <- loadImages(path.to.images, pattern = "_mask.tiff")
+# Add image number
+#imagenr <- read.csv("data/masks/ProteinPanel_masks/image_number_HIER.csv", header=FALSE)[1]
+mcols(all_masks)$ROI_ID <- "TMA266_ROI_f01_immune"
+# Scale images
+all_masks <- scaleImages(all_masks, 2^16-1)
+
+cur_img <- getImages(all_masks, "20200617_ZTMA266_immune_LKST_row1_to_row7_s0_a6_ac_ilastik_s2_Probabilities_mask")
+
+color <- c("grey", "red", rep("yellow",10))
+#names(color) <- unique(sce_full$celltype)
+
+# Color by cell type
+plotCells(cur_img, object = sce_full,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "celltype",
+            colour = list(celltype = c(epithelial = "#00FFFF",
+                          stromal_ne = "#3333FF",
+                          plasma_cell = "#009900",
+                          endothelial = "#FF9933",
+                          myeloid = "#FF0000",
+                          T_cell = "#00FF00",
+                          NK_cell = "#00FF00",
+                          undefined = "#C0C0C0",
+                          `HLA-DR_high` = "#C0C0C0",
+                          B_cell = "#FF3399",
+                          neutrophil = "#FF0000")),
+            scale_bar = NULL,
+            image_title = NULL)
+
+
+# Color by mask
+plotCells(cur_img, object = sce_full,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "mask",
+                      colour = list(celltype = c(epithelial = "#00FFFF",
+                          stromal_ne = "#3333FF",
+                          plasma_cell = "#009900",
+                          endothelial = "#FF9933",
+                          myeloid = "#FF0000",
+                          T_cell = "#00FF00",
+                          NK_cell = "#00FF00",
+                          undefined = "#C0C0C0",
+                          `HLA-DR_high` = "#C0C0C0",
+                          B_cell = "#FF3399",
+                          neutrophil = "#FF0000")),
+            scale_bar = NULL,
+            image_title = NULL)
+          
+```

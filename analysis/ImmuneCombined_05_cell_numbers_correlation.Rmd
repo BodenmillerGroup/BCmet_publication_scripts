@@ -1,0 +1,94 @@
+---
+title: "Fig1_Tcell_myeloid_combined_cell_numbers_correlation"
+author: "SandraTietscher"
+date: "2021-03-30"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+This scripts looks into compositional differences of the immune compartment between samples.
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(dittoSeq)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(cowplot)
+library(CATALYST)
+library(viridis)
+library(ggpubr)
+
+# Read immune sce
+sce_immune <- readRDS("output/SCEs/Tcell/TcellSCE_clustered.rds")
+sce_immune$patient.tissue <- paste(sce_immune$Patient.ID, sce_immune$Tissue.Type, sep = "_")
+sce_immune$patient.tissue.loc <- paste(sce_immune$patient.tissue, sce_immune$Location, sep = "_")
+
+# Read macrophage sce
+sce_mac <- readRDS("output/SCEs/myeloid/myeloidSCE_clustered.rds")
+sce_mac$patient.tissue <- paste(sce_mac$Patient.ID, sce_mac$Tissue.Type, sep = "_")
+sce_mac$patient.tissue.loc <- paste(sce_mac$patient.tissue, sce_mac$Location, sep = "_")
+
+# Read in ROI metadata
+ROI_meta <- read.csv("data/immune_images_patient_metadata_encoded.csv")
+
+ROI_meta <- ROI_meta[ROI_meta$Location != "na",]
+ROI_meta$patient.tissue <- paste(ROI_meta$Patient.ID, ROI_meta$Tissue.Type, sep = "_")
+sample_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue),]
+rownames(sample_unique) <- sample_unique$patient.tissue
+
+ROI_meta$patient.tissue.loc <- paste(ROI_meta$patient.tissue, ROI_meta$Location, sep = "_")
+ROI_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue.loc),]
+rownames(ROI_unique) <- ROI_unique$patient.tissue.loc
+```
+
+
+
+
+# Compare T cell and myeloid cell proportions between the two panels 
+
+For the same patient-tissue-location combinations
+
+```{r celltype-panel-correlation-PatTisLoc}
+## T cells
+
+im_Tcell <- table(sce_immune$patient.tissue.loc, sce_immune$celltype)[,"T_cell"]
+mac_Tcell <- table(sce_mac$patient.tissue.loc, sce_mac$celltype)[,"T_cell"]
+
+Tcell_comb <- merge(im_Tcell, mac_Tcell, by = "row.names")
+colnames(Tcell_comb) <- c("patient.tissue.loc", "T_cell_panel", "Myeloid_panel")
+
+ggplot(Tcell_comb, aes(T_cell_panel, Myeloid_panel))+
+  geom_point()+
+  stat_cor(method="spearman", label.x.npc = "middle", color = "black") + 
+  geom_smooth(method = lm, color = "black", se=FALSE)+ ggtitle("T cell counts")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        panel.background = element_blank())
+
+
+## Myeloid cells
+
+im_M <- table(sce_immune$patient.tissue.loc, sce_immune$celltype)[,c("myeloid", "HLA-DR_high", "neutrophil")]
+im_M <- rowSums(im_M)
+mac_M <- table(sce_mac$patient.tissue.loc, sce_mac$celltype)[,c("myeloid", "pDC", "LAMP3_DC", "neutrophil")]
+mac_M <- rowSums(mac_M)
+
+M_comb <- merge(im_M, mac_M, by = "row.names")
+colnames(M_comb) <- c("patient.tissue.loc", "T_cell_panel", "Myeloid_panel")
+
+ggplot(M_comb, aes(T_cell_panel,Myeloid_panel))+
+  geom_point()+
+  stat_cor(method="spearman", label.x.npc = "middle", color = "black") + 
+  geom_smooth(method = lm, color = "black", se=FALSE)+ ggtitle("Myeloid cell counts")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        panel.background = element_blank())
+```
+
+

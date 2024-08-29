@@ -1,0 +1,472 @@
+---
+title: "TumorPanel_01_QC_1stClustering"
+author: "LauraKuett"
+date: "2021-15-11"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+This script visualizes image level intensities for tumor panel and performs first clustering step to separated out epithelial cells for downstream analysis. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(ggridges)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(cowplot)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(scran)
+library(CATALYST)
+
+# Read SingleCellExperiment object
+sce <- readRDS("output/SCEs/tumor/tumorSCE_initial.rds")
+```
+
+# Remove control ROIs
+
+Placenta ROIs were acquired as an antibody control, but should not be included in the analysis.
+
+```{r remove-control-images}
+sce <- sce[, which(!(sce$Tissue.Type %in% c("ROI_yy", "ROI_xx", "ROI_zz")))]
+```
+
+# Remove empty channel
+
+No antibody in Nd144 -> remove.
+
+```{r remove-empty-channel}
+sce <- sce[rownames(sce) != "empty",]
+```
+
+
+# Generate colour vectors for main features
+
+Primarily, we will define colours for 
+1. the tissue type
+2. the location of the punch (intratumoral, margin, stromal)
+3. the patient ID
+
+```{r generate-colour-vectors}
+colour_vectors <- list()
+
+col_vec_tissuetype <- c( "#4C9900", "#FF8000", "#AC16AC", "#FF3333","#CCCC00")
+names(col_vec_tissuetype) <- c( "PT", "Bone", "Brain","Liver","SoftTissue")
+
+col_vec_location <- c("#3399FF","#9B4AF7", "#3333FF")
+names(col_vec_location) <- c("intratumoral", "stromal", "margin")
+
+col_vec_PatientID <- dittoColors(reps = 1)[seq_len(length(unique(sce$Patient.ID)))]
+names(col_vec_PatientID ) <- unique(sce$Patient.ID)
+col_vec_molecular_subtype <- c("#FC4E07","#E7B800","#00AFBB","gray")
+names(col_vec_molecular_subtype) <- c("Her2","luminal A", "luminal B","TN")
+
+colour_vectors$tissuetype <- col_vec_tissuetype
+colour_vectors$Location <- col_vec_location
+colour_vectors$PatientID <- col_vec_PatientID
+
+# Save in metadata slot
+metadata(sce)$colour_vectors <- colour_vectors
+
+```
+
+# Transform the data
+
+Different data transformations are stored in different assay slots:  
+arcsinh transformation -> `exprs` slot  
+scaled arcsinh transformation -> `scaled` slot (per column mean centered and divided by standard deviation)
+simple 0-1 normalization (using 99th percentile as 1) -> `normalized` slot  
+
+```{r data-transformation}
+assay(sce, "exprs") <- asinh(counts(sce))
+assay(sce, "scaled") <- t(scale(t(assay(sce, "exprs"))))
+
+norm_counts <- t(apply(assay(sce, "counts"), 1, function(x)(x-min(x))/(quantile(x, 0.99)-min(x))))
+norm_counts <- t(apply(norm_counts, 1, function(x) pmin(x, 1)))
+assay(sce, "normalized", withDimnames = FALSE) <- norm_counts
+```
+
+# Visualize image-level information
+
+
+## Number of cells
+
+First, we will visualize the number of cells across various cell-level metadata entries.
+Images with less than 100 cells are removed.
+
+
+### 2. Number of cells per image
+
+```{r no-cells-image, fig.width=6, fig.height=6}
+cellnumber_image <- as.data.frame(table(sce$ROI_ID))
+
+# lowest numbers
+sort(cellnumber_image$Freq)[1:30]
+
+# define images with less than 100 cells ###
+imageIDs_rm <- filter(cellnumber_image, Freq < 100)[,1]
+
+# Look at the image metadata before removing them
+sce.small <- sce[,which(sce$ROI_ID %in% imageIDs_rm)]
+table(sce.small$Tissue.Type)
+table(sce.small$Location)
+
+# remove
+sce <- sce[,which(!(sce$ROI_ID %in% imageIDs_rm))]
+```
+
+
+# Remove cells that are too small or too big
+
+
+```{r cell-size, fig.width=10}
+# Count and remove cells smaller than 7 pixels
+sum(sce$Area < 7)
+sce$include <- sce$Area >= 7
+sce <- sce[, which(sce$include == TRUE)]
+
+# Count and remove cells larger than 600 pixels
+sum(sce$Area > 600)
+sce$include <- sce$Area <= 600
+sce <- sce[, which(sce$include == TRUE)]
+
+```
+
+
+## Mean marker intensities 
+
+Next step: Visualization of the mean marker intensities per ROI.
+For this, we will use the `aggregateAcrossCells` function of the `scater` package, which returns a `SingleCellExperiment` object for further downstream processing. 
+We will arcsinh transform the mean intensity values prior to plotting.
+
+```{r mean-intensity-heatmap, fig.height=10, fig.width = 10}
+mean_sce <- aggregateAcrossCells(sce, ids = sce$ROI_ID, statistics = "mean")
+assay(mean_sce, "arcsinh") <- asinh(assay(mean_sce, "counts")) 
+
+
+# Centered and scaled
+dittoHeatmap(mean_sce, assay = "arcsinh",
+            annot.by = c("Tissue.Type", "Location"),
+            cluster_cols = TRUE, heatmap.colors = colorRampPalette(c("dark blue", "white", "dark red"))(100),
+            annotation_colors = list(Tissue.Type = metadata(sce)$colour_vectors$tissuetype,
+                                     Location = metadata(sce)$colour_vectors$Location),
+            breaks = seq(-3, 3, length.out = 101))
+```
+
+## Low-dimensional representation of image-level information
+
+Next, we can use the summarized `SingleCellExperiment` object to compute low-dimensional representations of image-level median intensity counts. For this, we will use a PCA representation of the images.
+
+```{r PCA-image-level, message = FALSE}
+# Principal component analysis
+mean_sce <- runPCA(mean_sce, exprs_values = "arcsinh", ncomponents = 10, 
+                   subset_row = !(rownames(mean_sce) %in% c("DNA1", "DNA2", "HH3")))
+plotPCA(mean_sce, colour_by = "Tissue.Type", shape_by = "Location", 
+        point_alpha = 1, point_size = 4) + 
+  scale_colour_manual(values = metadata(sce)$colour_vectors$tissuetype)
+
+```
+
+
+## Average cell size per Tissue Type
+
+```{r cell-size-tissuetype, fig.width=7, fig.height=5}
+colData <- as.data.frame(colData(sce))
+colData$Tissue.Type <- factor(colData$Tissue.Type)
+colData$Tissue.Type <- relevel(colData$Tissue.Type, "PT")
+
+ggplot(colData, aes(x = Tissue.Type, y = Area)) + 
+  geom_violin()+
+  geom_boxplot(outlier.size = 0.5, width = 0.2)+
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# UMAP representation of all cells
+
+For UMAP calculation, the normalized counts are used for a subset of cells to speed up the performance.
+
+
+## Calculate UMAP on a subset of the cells using markers that are also used for downstream clustering to seperated out epithelial cells
+
+```{r compute-UMAP}
+
+markers_include <- c("SMA","panCK","Vimentin","CK8_18_19","CD68", "CK14", "CD20","CD3", "CD11c",
+                     "HER2", "CK5","GATA3","CK7","CD8a",
+                     "Fibronectin","CD4","CD31_vWF","E/P-Cadherin")
+
+
+sce$cellID <- rownames(colData(sce))
+
+# For images with less than 300 cells: Use all cells
+as.data.frame(table(sce$ImageNumber)) %>% 
+  filter(Freq < 300) %>% 
+  pull(Var1) -> small.images
+cell_idx_smallImages <- sce[, which(sce$ImageNumber %in% small.images)]$cellID
+
+# For image with more than 300 cells: Randomly sample 300 cells
+colData(sce[,which(!(sce$ImageNumber %in% small.images))]) %>%
+  as.data.frame() %>%
+  group_by(ImageNumber) %>%
+  sample_n(300) %>% 
+  pull(cellID) -> cell_idx_largeImages
+
+cell_idx <- c(cell_idx_largeImages, cell_idx_smallImages)
+sce_sub <- sce[,cell_idx]
+
+
+
+# Run Dimensional reduction
+sce_sub <- runUMAP(sce_sub,n_neighbors =15,  exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_sub, "normalized")) %in% markers_include)
+
+
+```
+## Visualize features on UMAP
+
+```{r visualize-features-umap, message = FALSE, fig.width=10, fig.height=8}
+
+dittoDimPlot(sce_sub, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$tissuetype, opacity = 0.3) 
+
+dittoDimPlot(sce_sub, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.5) 
+
+dittoDimPlot(sce_sub, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$Location, opacity = 0.3)
+
+dittoDimPlot(sce_sub, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$Location, split.by = "Location",opacity = 0.5)
+
+dittoDimPlot(sce_sub, var = "molecular.subtype", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce)$colour_vectors$Location, split.by = "Location",opacity = 0.5)
+```
+
+## Visualize expression on UMAP
+
+Visualize the expression of each marker.
+
+### 1. Arcsinh-transformed counts
+
+```{r arcsinh-expression-umap, fig.width=35, fig.height=25}
+#ER not working for plotting on UMAP
+markers_to_plot <- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin","CK8_18_19","CD68", "CK14","p53", "CD20", "GLUT1","CD3","p-HH3", "CD11c",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR", "CD45","GATA3","CK7","CD8a", 
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6","CD4","CD31_vWF",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1","Ki-67_Pt198" )
+
+p.list <- list()
+for(i in markers_to_plot){
+  p.list[[i]] <- plotUMAP(sce_sub, colour_by = i, by_exprs_values = "scaled", 
+                          point_size = 0.5, point_alpha = 1)  + scale_colour_gradient2(name = i, low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-3, 3), na.value = "#b2182b")
+}
+
+plot_grid(plotlist = p.list, ncol =8)
+```
+
+# Run graph-based clustering (Phenograph)
+
+Use normalized counts for clustering.
+Include only markers that are relevant for the general distinction between tumor and stromal cells
+
+```{r phenograph-clustering}
+
+cluster_counts_normalized <- subset(assay(sce, "normalized"), rownames(assay(sce, "normalized")) %in% markers_include)
+
+g <- buildSNNGraph(cluster_counts_normalized, k=5, type = "jaccard")
+clust<- igraph::cluster_louvain(g)$membership
+table(clust)
+
+
+# add cluster information to sce object
+sce$phenograph_cluster_5 <- as.factor(clust)
+
+# add cluster information to sce_sub object
+sub_cellnames <- colnames(sce_sub)
+cluster_sub <- sce[,sub_cellnames]$phenograph_cluster_5
+sce_sub$phenograph_cluster_5 <- cluster_sub
+
+```
+
+
+## Cluster annotation
+
+Annotate each cluster with three metadata columns:
+`class` is either epithelial, stromal, immune or undefined,`celltype` is a more precise celltype annotation
+Clusters high for CD20, CD4,CD3, CD45, CD8a, CD11c, CD68 expression were identified as immune cells. The CD31+vWF high cluster was used for marking endothelial cells. Clusters with high expression of SMA, vimentin, and fibronectin and low expression of panCK or E/P-cadherin were considered to be stromal cells. All clusters expressing panCK or E/P-cadherin as evaluated on the density plot were assigned as epithelial clusters, except where CK5 and CK14 markers were used for indicating basal cell clusters.
+
+
+```{r cluster_annotation, fig.width=12, fig.height=12}
+labels <- read.csv("data/cluster_annotations/tumorPanel_phenograph_k5_initial_cluster_annotation.csv")
+
+label_class <- labels$class[match(sce$phenograph_cluster_5, labels$cluster)]
+sce$cell_class <- label_class
+
+label_celltype <- labels$celltype[match(sce$phenograph_cluster_5, labels$cluster)]
+sce$celltype <- label_celltype
+
+
+#plot on UMAP
+label_class_sub <- labels$class[match(sce_sub$phenograph_cluster_5, labels$cluster)]
+sce_sub$cell_class <- label_class_sub
+label_celltype_sub <- labels$celltype[match(sce_sub$phenograph_cluster_5, labels$cluster)]
+sce_sub$celltype <- label_celltype_sub
+
+
+dittoDimPlot(sce_sub, var = "cell_class", reduction.use = "UMAP", size = 0.5)
+dittoDimPlot(sce_sub, var = "celltype", reduction.use = "UMAP", size = 0.5)
+dittoDimPlot(sce_sub, var = "phenograph_cluster_5", reduction.use = "UMAP", size = 0.5)
+```
+
+## Heatmap of cluster marker expression
+
+```{r  heatmap-mean-marker-expression-per-cluster}
+rowData(sce)$marker_class <- ifelse(rownames(sce) %in% markers_include, "type", "state")
+rowData(sce)$marker_class <- ifelse(rownames(sce) %in% c("DNA1", "DNA2"), "none", rowData(sce)$marker_class)
+
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type)) 
+
+
+sce$cluster_id <- sce$phenograph_cluster_5
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+plotMultiHeatmap(sce, 
+hm1 = "type", hm2 = "state", 
+k = "custom", col_dend = c(TRUE, TRUE), assay = "counts", scale = "last", row_anno= FALSE,bars = TRUE, perc = TRUE, fun = "mean")
+
+```
+
+# Evaluate panCK and Ecadherin expression on a density plot to make sure that epithelial clusters will have expression of these markers
+
+```{r panCK-Ecad- marker-distribution-per-cluster}
+plotClusterExprs(sce, k = "custom", features = c("panCK", "E/P-Cadherin"))
+```
+
+### Mark matched patient samples with new column in sce
+
+```{r matched-samples-annotation}
+
+# Subset the metadata to exclude images that have been excluded due to small cell numbers
+image_metadata <- read.csv("data/tumor_images_patient_metadata_encoded.csv")
+image_metadata <- image_metadata[!(duplicated(image_metadata$ROI_ID)),]
+rownames(image_metadata) <- image_metadata$ROI_ID
+images_incl <- unique(sce$ROI_ID)
+image_metadata <- image_metadata[images_incl,]
+
+
+# Separate PT and metastasis images
+image_metadata_PT <- filter(image_metadata, Tissue.Type == "PT")
+image_metadata_met <- filter(image_metadata, Tissue.Type != "PT")
+
+# Count PT images for different locations
+table_PT <- as.data.frame(table(image_metadata_PT$Patient.ID, image_metadata_PT$Location))
+
+# Count metastasis images
+table_met <- as.data.frame(table(image_metadata_met$Patient.ID, image_metadata_met$Tissue.Type ))
+
+# Combine tables
+table_comb <- rbind(table_PT, table_met)
+table_comb_short <- pivot_wider(table_comb, names_from = Var2, values_from = Freq)
+table_comb_short[is.na(table_comb_short)] = 0
+colnames(table_comb_short)[1:4] <- c("PatientID", "PT_intratumoral", "PT_margin", "PT_stromal")
+table_comb_short$anyMetastasis <- rowSums(table_comb_short[,5:8])
+
+# Number of patients that have images from different metastasis sites
+table_met_excl <- filter(table_met, Freq > 0)
+test <- as.vector(table(table_met_excl$Var1))
+length(test[test >1])
+
+table_comb_short$anyPrimary <- rowSums(table_comb_short[,2:4])
+# Remove patients that do not have any images from metastatic sites
+table_comb_short <- table_comb_short %>% filter(anyPrimary != 0)
+table_comb_short <- table_comb_short %>% filter(anyMetastasis != 0)
+
+matched_samples <- rep(0,length(colnames(sce)))
+#Indicate which patients have matched samples present in our dataset
+matched_patients <- as.character(table_comb_short$PatientID)
+index_matched_samples_multiple <- sce$Patient.ID %in% matched_patients
+matched_samples[index_matched_samples_multiple] <- 1
+sce$matched_samples <- matched_samples
+sce$matched_samples <- factor(sce$matched_samples)
+
+```
+
+### Plot cell numbers per patient
+
+```{r cell-numbers-per-patient}
+sce1 <- filterSCE(sce,sce$matched_samples==1)
+
+cellnumber <- as.data.frame(table(sce1$Patient.ID, sce1$Tissue.Type))
+cellnumber$Var2 <- factor(cellnumber$Var2)
+cellnumber$Var2 <- relevel(cellnumber$Var2, "PT")
+cellnumber1 <- cellnumber[cellnumber$Freq!=0,]
+cellnumber1$Freq_log <- log10(cellnumber1$Freq)
+
+ggplot(cellnumber1, aes(x=Var2, y = Freq_log)) +
+  geom_boxplot(outlier.size = 0.5, width = 0.2)+
+ theme(axis.ticks.x = element_blank(),
+        axis.text.x=element_text(angle = 90, hjust=1),
+        axis.title.x = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        strip.background = element_blank(),
+        legend.background = element_blank())+
+  labs(title="Number of all cells per patient", y = "Cell count (log10)")
+```
+
+### cell class proportion in intratumoral regions only (most metastasis samples have only intratumoral regions)
+```{r cell-class-proportions-intratumoral-region}
+
+sce_intratum <- sce[,which(sce1$Location == "intratumoral")]
+tab <- as.data.frame(prop.table(table(sce_intratum$sample_id, sce_intratum$cell_class), margin = 1))
+colnames(tab) <- c("sample_id", "cell_class", "proportion")
+tab <- tab[complete.cases(tab),]
+
+ROI_tissue <- as.data.frame(table(sce_intratum$sample_id, sce_intratum$Tissue.Type)) %>% filter(Freq > 0)
+tab$tissue <- ROI_tissue$Var2[match(tab$sample_id, ROI_tissue$Var1)]
+tab$tissue <- relevel(tab$tissue, "PT")
+
+ggplot(tab, aes(x= tissue, y = proportion))+
+  geom_boxplot()+
+  geom_point()+
+  facet_wrap(~cell_class, scales="fixed", ncol=6, strip.position="top")+
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x=element_text(angle = 90, hjust=1),
+        axis.title.x = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        strip.background = element_blank(),
+        legend.background = element_blank())+
+  ylab("Of total [%]")
+
+```
+
+
+# Save SCE object
+
+```{r}
+saveRDS(sce, "output/SCEs/tumor/tumorSCE_initial_clustered.rds")
+```
+

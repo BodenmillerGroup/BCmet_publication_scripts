@@ -1,0 +1,305 @@
+---
+title: "x"
+author: "Alina Bollhagen"
+date: "2023-03-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Correlation of cell types
+
+```{r Library and data loading}
+
+# Load libraries
+library(SingleCellExperiment)
+library(tidyverse)
+library(imcRtools)
+library(pheatmap)
+library(viridis)
+library(edgeR)
+library(BiocParallel)
+library(igraph)
+library(corrr)
+library(ggraph)
+library(spicyR)
+library(ggplot2)
+library(ComplexHeatmap)
+library(ade4)
+library(circlize)
+
+
+# Read SingleCellExperiment objects
+sce_tumor <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/tumor/tumorSCE_initial_clustered_with_tumor_clusters.rds")
+sce_Tcells <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_myeloid <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+
+sce_tumor$ROI <- substr(sce_tumor$ROI_ID, 1,14)
+sce_Tcells$ROI <- substr(sce_Tcells$ROI_ID, 1,14)
+sce_myeloid$ROI <- substr(sce_myeloid$ROI_ID, 1,14)
+
+# Extract epithelial, endothelial, B cells and stroma from tumor SCE, T cells and myeloid cells
+sce_tumor <- sce_tumor[,which(sce_tumor$celltype %in% c("Epithelial", "Endothelial", "Stroma"))]
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$celltype %in% c("NK_cell", "T_cell", "plasma_cell", "B_cell"))]
+sce_Tcells <- sce_Tcells[,-which(sce_Tcells$celltype == "T_cell" & sce_Tcells$Tcell_subtype == "none")]
+sce_myeloid <- sce_myeloid[,which(!(sce_myeloid$M_cluster %in% "none"))]
+
+# Name tumor clusters
+tumor_clusters <- tumor_clusters <- c("CK+ HER2+", "CK+ HR+ 1", "CK+ mTOR+", "CK+ HRhigh","EGFR+ hypoxic", 
+                    "CK7+ CK+", "CK+ HR+ 2", "anti-apoptotic", "EGFR+ p53+", "proliferative", 
+                    "immune-evasive", "CKlow HR+", "apoptotic", "hypoxic", "myoepithelial", 
+                    "CK+ HRlow", "HLA-ABC+ basal", "basal", "CKlow HER2+", "epitheliallow")
+names(tumor_clusters) <- as.character(c(1:20))
+
+cols_tumor_clusters <- c("#680C07", "#BC544B", "#CC0000", "#9B2D1F", "#4E0707", 
+                         "#D34817", "#FF6600", "#FA8128", "#FCAE1E", "#B56727",
+                         "#80400B", "#D67229", "#330000", "#E3B778", "#FAE29C",
+                         "#FDD0A2", "#C9BB8E", "#918485", "#FF3333", "#993300")
+
+# Name myeloid clusters
+myeloid_clusters <- c("ARG1+ myeloid", "ap myeloid", "proliferative myeloid", "pro-inflammatory macrophages", 
+                      "IDO+ myeloid", "immunomod. macrophages 1", "myeloid", "MMP9+ macrophages",
+                      "monocytes", "STING+ myeloid", "cDC1", "activated myeloid",
+                      "immunomod. macrophages 2", "activated monocytes", "PD-L1+ hypoxic myeloid", "immunomod. macrophages 3",
+                      "moDC", "LAMP3 DC", "neutrophils", "pDC")
+names(myeloid_clusters) <- c("M_c1", "M_c2", "M_c3", "M_c4", 
+                             "M_c5", "M_c6", "M_c7", "M_c8", 
+                             "M_c9", "M_c10", "M_c11", "M_c12", 
+                             "M_c13", "M_c14", "M_c15", "M_c16", "M_c17",
+                             "LAMP3_DC", "neutrophil", "pDC")
+
+cols_myeloid_clusters <- c("#663399", "#6600CC", "#330099", "#333366", 
+                           "#9933FF", "#666699", "#333399", "#6666CC",
+                           "#3333CC", "#6666FF", "#3399FF", "#33CCFF",
+                           "#66CCFF", "#6699FF", "#3366FF", "#00CCFF",
+                           "#0099FF", "#0066FF", "#000066", "#003366")
+                           
+names(cols_myeloid_clusters) <- myeloid_clusters
+                           
+# Name T cell clusters
+
+immune_clusters <- c("B cells", "NK cells", "plasma cells")
+names(immune_clusters) <- c("B_cell", "NK_cell", "plasma_cell")
+cols_immune_clusters <- c("#003300", "#006633", "#009966")
+names(cols_immune_clusters) <- immune_clusters
+
+Tcell_clusters <- c("exhausted CD8 T cell", "Treg", "TCF7+ CD4 T cell", "CD4 Thelper cells",
+                    "developing Treg", "effector CD8 T cell", "Tfh", "TCF7+ CD8 T cell", "cytotoxic CD8 T cell", 
+                    "CD7 CD8 T cell", "activated CD8 T cell")
+
+names(Tcell_clusters) <- c("CD8_exhausted", "Treg", "CD4_TCF7-high", "CD4_Thelper", 
+                           "Treg-developing", "CD8_effector", "Tfh", "CD8_TCF7-high", 
+                           "CD8_GZMB-high", "CD8_CD7-high", "CD8_activated")
+
+cols_Tcell_clusters <- c("#33CC00", "#00CC33", "#339900", "#006600",
+                         "#009933", "#336633", "#00FF66", "#00CC00",
+                         "#669966", "#009900", "#99FF00")
+
+names(cols_Tcell_clusters) <- Tcell_clusters
+
+# Adapt cluster names
+sce_tumor$celltype[which(sce_tumor$cell_class == "epithelial")] <- tumor_clusters[sce_tumor$celltypeTumorClusters[which(sce_tumor$cell_class == "epithelial")]]
+sce_Tcells$celltype[which(sce_Tcells$celltype == "T_cell")] <- Tcell_clusters[sce_Tcells$Tcell_subtype[which(sce_Tcells$celltype == "T_cell")]]
+sce_myeloid$celltype <- myeloid_clusters[sce_myeloid$M_cluster]
+
+# Select intratumoral regions
+sce_tumor <- sce_tumor[,which(sce_tumor$Location == "intratumoral")]
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$Location == "intratumoral")]
+sce_myeloid <- sce_myeloid[,which(sce_myeloid$Location == "intratumoral")]
+
+sce_tumor$imageCellID <- sce_tumor$cellID
+sce_tumor$cellID <- NULL
+
+sce_Tcells$imageCellID <- sce_Tcells$cellID
+sce_Tcells$cellID <- NULL
+
+sce_myeloid$imageCellID <- sce_myeloid$cellID
+sce_myeloid$cellID <- NULL
+
+```
+
+
+```{r Correlation of celltype proportions per image}
+
+# Defining sample types
+sce_Tcells$sample_type <- "M"
+sce_Tcells$sample_type[which(sce_Tcells$Tissue.Type == "PT")] <- "PT"
+sce_myeloid$sample_type <- "M"
+sce_myeloid$sample_type[which(sce_myeloid$Tissue.Type == "PT")] <- "PT"
+
+# Count celltypes per ROI for PT
+tumor_PT <- as.data.frame(unclass(table(sce_tumor$ROI[which(sce_tumor$sample_type == "PT")], sce_tumor$celltype[which(sce_tumor$sample_type == "PT")])))
+Tcells_PT <- as.data.frame(unclass(table(sce_Tcells$ROI[which(sce_Tcells$sample_type == "PT")], sce_Tcells$celltype[which(sce_Tcells$sample_type == "PT")])))
+myeloid_PT <- as.data.frame(unclass(table(sce_myeloid$ROI[which(sce_myeloid$sample_type == "PT")], sce_myeloid$celltype[which(sce_myeloid$sample_type == "PT")])))
+
+composition_PT <- merge(tumor_PT, Tcells_PT, by = "row.names", all = FALSE)
+rownames(composition_PT) <- composition_PT$Row.names
+composition_PT$Row.names <- NULL
+composition_PT <- merge(composition_PT, myeloid_PT, by = "row.names", all = FALSE)
+rownames(composition_PT) <- composition_PT$Row.names
+composition_PT$Row.names <- NULL
+
+# Cell type composition for metastasis
+tumor_M <- as.data.frame(unclass(table(sce_tumor$ROI[which(sce_tumor$sample_type == "M")], sce_tumor$celltype[which(sce_tumor$sample_type == "M")])))
+Tcells_M <- as.data.frame(unclass(table(sce_Tcells$ROI[which(sce_Tcells$sample_type == "M")], sce_Tcells$celltype[which(sce_Tcells$sample_type == "M")])))
+myeloid_M <- as.data.frame(unclass(table(sce_myeloid$ROI[which(sce_myeloid$sample_type == "M")], sce_myeloid$celltype[which(sce_myeloid$sample_type == "M")])))
+
+composition_M <- merge(tumor_M, Tcells_M, by = "row.names", all = FALSE)
+rownames(composition_M) <- composition_M$Row.names
+composition_M$Row.names <- NULL
+composition_M <- merge(composition_M, myeloid_M, by = "row.names", all = FALSE)
+rownames(composition_M) <- composition_M$Row.names
+composition_M$Row.names <- NULL
+
+# Calculate proportional abundance
+composition_PT <- as.data.frame(t(apply(composition_PT, MARGIN = 1, FUN = function(x) x/sum(x))))
+composition_M <- as.data.frame(t(apply(composition_M, MARGIN = 1, FUN = function(x) x/sum(x))))
+
+# Calculate frequency
+freq_PT <- apply(composition_PT, MARGIN = 2, FUN = function(x) median(x))
+
+```
+
+```{r Correlation of celltype proportions per image}
+
+# Create a tidy data frame of correlations
+cors_PT <- composition_PT %>% 
+  correlate()
+
+cors_M <- composition_M %>% 
+  correlate()
+
+# Calculate significance of correlations
+sig_PT <- matrix(nrow = length(colnames(composition_PT)), ncol = length(colnames(composition_PT)))
+for(i in 1:length(colnames(composition_PT))){
+  for(j in 1:length(colnames(composition_PT))){
+  sig_PT[i,j] <- cor.test(composition_PT[,i], composition_PT[,j])$p.value
+  }
+}
+
+rownames(sig_PT) <- colnames(composition_PT)
+colnames(sig_PT) <- colnames(composition_PT)
+sig_PT <- as_cordf(sig_PT)
+
+sig_M <- matrix(nrow = length(colnames(composition_M)), ncol = length(colnames(composition_M)))
+for(i in 1:length(colnames(composition_M))){
+  for(j in 1:length(colnames(composition_M))){
+  sig_M[i,j] <- cor.test(composition_M[,i], composition_M[,j])$p.value
+  }
+}
+
+rownames(sig_M) <- colnames(composition_M)
+colnames(sig_M) <- colnames(composition_M)
+sig_M <- as_cordf(sig_M)
+
+# adjusting the dataframes
+cors_PT <- as.data.frame(cors_PT)
+cors_PT[is.na(cors_PT)] <- 1
+rownames(cors_PT) <- cors_PT$term
+cors_PT$term <- NULL
+
+sig_PT <- as.data.frame(sig_PT)
+sig_PT[is.na(sig_PT)] <- 1
+rownames(sig_PT) <- sig_PT$term
+sig_PT$term <- NULL
+
+cors_M <- as.data.frame(cors_M)
+cors_M[is.na(cors_M)] <- 1
+rownames(cors_M) <- cors_M$term
+cors_M$term <- NULL
+
+sig_M <- as.data.frame(sig_M)
+sig_M[is.na(sig_M)] <- 1
+rownames(sig_M) <- sig_M$term
+sig_M$term <- NULL
+
+# Adjust p value
+sig_PT <- matrix(p.adjust(as.vector(as.matrix(sig_PT)), method='fdr'), ncol = length(colnames(sig_PT)))
+sig_M <- matrix(p.adjust(as.vector(as.matrix(sig_M)), method='fdr'), ncol = length(colnames(sig_M)))
+
+# Mantel test
+mantel.rtest(as.dist(cors_PT), as.dist(cors_M))
+
+```
+
+```{r Plotting}
+
+cluster_cols <- c(cols_tumor_clusters, cols_Tcell_clusters, cols_myeloid_clusters, cols_immune_clusters, "gold", "skyblue")
+names(cluster_cols) <- c(tumor_clusters, Tcell_clusters, myeloid_clusters, names(immune_clusters), "Endothelial", "Stroma")
+
+
+bottom_ha <- HeatmapAnnotation(cluster = colnames(cors_PT),
+                        col = list(cluster = cluster_cols),
+                        show_legend = FALSE
+                        )
+left_ha <- rowAnnotation(cluster = colnames(cors_M),
+                        col = list(cluster = cluster_cols),
+                        show_legend = FALSE
+                        )
+
+cols <- colorRamp2(c(-1,0,1), c("blue", "white", "red"))
+cols_sig <- colorRamp2(c(-1,0,1), c("darkblue", "white", "brown3"))
+
+# Plotting primary tumors
+hp <- Heatmap(as.matrix(cors_PT),
+        rect_gp = gpar(type = "none"),
+        bottom_annotation = bottom_ha,
+        left_annotation = left_ha,
+        col = cols,
+        show_column_dend = FALSE,
+        show_row_names = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        cell_fun = function(j, i, x, y, w, h, fill) {
+                  if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6) {
+            grid.rect(x, y, w, h, 
+                        gp = gpar(fill = fill, col = fill))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_PT[i,j] < 0.05 & sig_PT[i,j] >= 0.01) {
+            grid.circle(x, y, w, h, r = unit(0.5, "mm"),
+                        gp = gpar(fill = cols_sig(cors_PT[i,j]/sig_PT[i,j]), col = NA))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_PT[i,j] < 0.01 & sig_PT[i,j] >= 0.001) {
+            grid.circle(x, y, w, h, r = unit(0.7, "mm"),
+                        gp = gpar(fill = cols_sig(cors_PT[i,j]/sig_PT[i,j]), col = NA))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_PT[i,j] < 0.001) {
+            grid.circle(x, y, w, h, r = unit(0.9, "mm"),
+                        gp = gpar(fill = cols_sig(cors_PT[i,j]/sig_PT[i,j]), col = NA))
+        }
+    })
+
+
+# Plotting metastases
+Heatmap(as.matrix(cors_M),
+        rect_gp = gpar(type = "none"),
+        bottom_annotation = bottom_ha,
+        left_annotation = left_ha,
+        col = cols,
+        show_column_dend = FALSE,
+        show_row_names = FALSE,
+        column_names_gp = gpar(fontsize = 10),
+        cell_fun = function(j, i, x, y, w, h, fill) {
+                  if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6) {
+            grid.rect(x, y, w, h, 
+                        gp = gpar(fill = fill, col = fill))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_M[i,j] < 0.05 & sig_M[i,j] >= 0.01) {
+            grid.circle(x, y, w, h, r = unit(0.5, "mm"),
+                        gp = gpar(fill = cols_sig(cors_M[i,j]/sig_M[i,j]), col = NA))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_M[i,j] < 0.01 & sig_M[i,j] >= 0.001) {
+            grid.circle(x, y, w, h, r = unit(0.7, "mm"),
+                        gp = gpar(fill = cols_sig(cors_M[i,j]/sig_M[i,j]), col = NA))
+        }
+        if(as.numeric(x) <= 1 - as.numeric(y) + 1e-6 & sig_M[i,j] < 0.001) {
+            grid.circle(x, y, w, h, r = unit(0.9, "mm"),
+                        gp = gpar(fill = cols_sig(cors_M[i,j]/sig_M[i,j]), col = NA))
+        }
+    })
+
+```
+

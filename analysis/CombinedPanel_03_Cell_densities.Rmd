@@ -1,0 +1,611 @@
+---
+title: "Untitled"
+author: "Alina Bollhagen"
+date: "2024-03-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+objects <- read.csv("/Volumes/G_DQBM_BB_Central$/users/alboll/density_calc/objects_Tcells.csv")
+objects_myeloid <- read.csv("/Volumes/G_DQBM_BB_Central$/users/alboll/density_calc/objects.csv")
+
+
+# Read SingleCellExperiment objects
+sce_Tcells <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_myeloid <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+
+sce_Tcells$ROI <- substr(sce_Tcells$ROI_ID, 1,14)
+sce_myeloid$ROI <- substr(sce_myeloid$ROI_ID, 1,14)
+
+# Extract epithelial, endothelial, B cells and stroma from tumor SCE, T cells and myeloid cells
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$celltype %in% c("NK_cell", "T_cell", "plasma_cell", "B_cell"))]
+sce_Tcells <- sce_Tcells[,-which(sce_Tcells$celltype == "T_cell" & sce_Tcells$Tcell_subtype == "none")]
+sce_myeloid <- sce_myeloid[,which(!(sce_myeloid$M_cluster %in% "none"))]
+
+# Name myeloid clusters
+myeloid_clusters <- c("ARG1+ myeloid", "ap myeloid", "proliferative myeloid", "pro-inflammatory macrophages", 
+                      "IDO+ myeloid", "immunomod. macrophages 1", "myeloid", "MMP9+ macrophages",
+                      "monocytes", "STING+ myeloid", "cDC1", "activated myeloid",
+                      "immunomod. macrophages 2", "activated monocytes", "PD-L1+ hypoxic myeloid", "immunomod. macrophages 3",
+                      "moDC", "LAMP3 DC", "neutrophils", "pDC")
+names(myeloid_clusters) <- c("M_c1", "M_c2", "M_c3", "M_c4", 
+                             "M_c5", "M_c6", "M_c7", "M_c8", 
+                             "M_c9", "M_c10", "M_c11", "M_c12", 
+                             "M_c13", "M_c14", "M_c15", "M_c16", "M_c17",
+                             "LAMP3_DC", "neutrophil", "pDC")
+                           
+# Name T cell clusters
+
+immune_clusters <- c("B cells", "NK cells", "plasma cells")
+names(immune_clusters) <- c("B_cell", "NK_cell", "plasma_cell")
+
+Tcell_clusters <- c("exhausted CD8 T cell", "Treg", "TCF7+ CD4 T cell", "CD4 Thelper cells",
+                    "developing Treg", "effector CD8 T cell", "Tfh", "TCF7+ CD8 T cell", "cytotoxic CD8 T cell", 
+                    "CD7 CD8 T cell", "activated CD8 T cell")
+
+names(Tcell_clusters) <- c("CD8_exhausted", "Treg", "CD4_TCF7-high", "CD4_Thelper", 
+                           "Treg-developing", "CD8_effector", "Tfh", "CD8_TCF7-high", 
+                           "CD8_GZMB-high", "CD8_CD7-high", "CD8_activated")
+
+
+# Adapt cluster names
+sce_Tcells$celltype[which(sce_Tcells$celltype == "T_cell")] <- Tcell_clusters[sce_Tcells$Tcell_subtype[which(sce_Tcells$celltype == "T_cell")]]
+sce_myeloid$celltype <- myeloid_clusters[sce_myeloid$M_cluster]
+
+# Select intratumoral regions
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$Location == "intratumoral")]
+sce_myeloid <- sce_myeloid[,which(sce_myeloid$Location == "intratumoral")]
+
+sce_Tcells$imageCellID <- sce_Tcells$cellID
+sce_Tcells$cellID <- NULL
+
+sce_myeloid$imageCellID <- sce_myeloid$cellID
+sce_myeloid$cellID <- NULL
+
+```
+
+```{r transfer tumor and stroma masks to sce object}
+
+# Tcells
+sce_Tcells$file <- str_sub(sce_Tcells$file, end=-10)
+objects$Image <- str_sub(objects$Image, end=-16)
+
+area <- aggregate(objects$area, by = list(objects$Image), function(x) sum(x))
+
+vector <- area$x
+names(vector) <- area$Group.1
+
+# Myeloid
+sce_myeloid$file <- str_sub(sce_myeloid$file, end=-10)
+objects_myeloid$Image <- str_sub(objects_myeloid$Image, end=-16)
+
+area <- aggregate(objects_myeloid$area, by = list(objects_myeloid$Image), function(x) sum(x))
+
+vector_1 <- area$x
+names(vector_1) <- area$Group.1
+
+
+```
+
+
+```{r density calculations}
+
+Tcells <- as.data.frame(unclass(table(sce_Tcells$file, sce_Tcells$Tcell_subtype)))
+tissue <- distinct(as.data.frame(colData(sce_Tcells)[,c("file", "Tissue.Type", "Patient.ID", "ROI")]))
+Tcells$tissue.type <- tissue$Tissue.Type
+Tcells$PID <- tissue$Patient.ID
+Tcells$ROI <- tissue$ROI
+Tcells$area <- vector[rownames(Tcells)]
+
+for(i in unique(sce_Tcells$Tcell_subtype)){
+  Tcells[,i] <- Tcells[,i]/Tcells$area
+}
+
+Tcells[is.na(Tcells)] <- 0
+
+myeloid <- as.data.frame(unclass(table(sce_myeloid$file, sce_myeloid$celltype)))
+tissue <- distinct(as.data.frame(colData(sce_myeloid)[,c("file", "Tissue.Type", "Patient.ID", "ROI")]))
+myeloid$tissue.type <- tissue$Tissue.Type
+myeloid$PID <- tissue$Patient.ID
+myeloid$ROI <- tissue$ROI
+myeloid$area <- vector_1[rownames(myeloid)]
+
+for(i in unique(sce_myeloid$celltype)[-1]){
+  myeloid[,i] <- myeloid[,i]/myeloid$area
+}
+
+myeloid[is.na(myeloid)] <- 0
+
+```
+
+```{r}
+
+# Brain
+PID_Brain <- Tcells$PID[which(Tcells$tissue.type == "Brain")]
+PID_PT <- Tcells$PID[which(Tcells$tissue.type == "PT")]
+PID_Brain <- intersect(PID_Brain, PID_PT)
+
+Brain <- Tcells[which(Tcells$PID %in% PID_Brain & Tcells$tissue.type %in% c("PT", "Brain")),]
+Brain$PID_tissue <- paste0(Brain$PID, "_", Brain$tissue.type)
+Brain <- aggregate(Brain[,1:12], by = list(Brain$PID_tissue), function(x) mean(x))
+Brain$tissue.type <- str_sub(Brain$Group.1,-2,-1)
+
+pval_brain <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+logFC_brain <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+celltypes <- unique(sce_Tcells$Tcell_subtype)
+names(pval_brain) <- names(logFC_brain) <- celltypes
+for (i in celltypes) {
+  pval_brain[i] <- wilcox.test(Brain[which(Brain$tissue.type == "PT"),i], Brain[which(Brain$tissue.type == "in"),i], paired = TRUE)$p.value
+  logFC_brain[i] <- log(mean(Brain[which(Brain$tissue.type == "in"),i])/mean(Brain[which(Brain$tissue.type == "PT"),i]))
+}
+
+pval_brain <- p.adjust(pval_brain, method = "fdr", n = length(pval_brain))
+
+# Liver
+PID_Liver <- Tcells$PID[which(Tcells$tissue.type == "Liver")]
+PID_Liver <- intersect(PID_Liver, PID_PT)
+
+Liver <- Tcells[which(Tcells$PID %in% PID_Liver & Tcells$tissue.type %in% c("PT", "Liver")),]
+Liver$PID_tissue <- paste0(Liver$PID, "_", Liver$tissue.type)
+Liver <- aggregate(Liver[,1:12], by = list(Liver$PID_tissue), function(x) mean(x))
+Liver$tissue.type <- str_sub(Liver$Group.1,-2,-1)
+
+pval_liver <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+logFC_liver <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+celltypes <- unique(sce_Tcells$Tcell_subtype)
+names(pval_liver) <- names(logFC_liver) <- celltypes
+for (i in celltypes) {
+  pval_liver[i] <- wilcox.test(Liver[which(Liver$tissue.type == "PT"),i], Liver[which(Liver$tissue.type == "er"),i], paired = TRUE)$p.value
+  logFC_liver[i] <- log(mean(Liver[which(Liver$tissue.type == "er"),i])/mean(Liver[which(Liver$tissue.type == "PT"),i]))
+}
+
+pval_liver <- p.adjust(pval_liver, method = "fdr", n = length(pval_liver))
+
+# Bone
+PID_Bone <- Tcells$PID[which(Tcells$tissue.type == "Bone")]
+PID_Bone <- intersect(PID_Bone, PID_PT)
+
+Bone <- Tcells[which(Tcells$PID %in% PID_Bone & Tcells$tissue.type %in% c("PT", "Bone")),]
+Bone$PID_tissue <- paste0(Bone$PID, "_", Bone$tissue.type)
+Bone <- aggregate(Bone[,1:12], by = list(Bone$PID_tissue), function(x) mean(x))
+Bone$tissue.type <- str_sub(Bone$Group.1,-2,-1)
+
+pval_bone <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+logFC_bone <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+celltypes <- unique(sce_Tcells$Tcell_subtype)
+names(pval_bone) <- names(logFC_bone) <- celltypes
+for (i in celltypes) {
+  pval_bone[i] <- wilcox.test(Bone[which(Bone$tissue.type == "PT"),i], Bone[which(Bone$tissue.type == "ne"),i], paired = TRUE)$p.value
+  logFC_bone[i] <- log(mean(Bone[which(Bone$tissue.type == "ne"),i])/mean(Bone[which(Bone$tissue.type == "PT"),i]))
+}
+
+pval_bone <- p.adjust(pval_bone, method = "fdr", n = length(pval_bone))
+
+# SoftTissue
+PID_SoftTissue <- Tcells$PID[which(Tcells$tissue.type == "SoftTissue")]
+PID_SoftTissue <- intersect(PID_SoftTissue, PID_PT)
+
+SoftTissue <- Tcells[which(Tcells$PID %in% PID_SoftTissue & Tcells$tissue.type %in% c("PT", "SoftTissue")),]
+#SoftTissue <- SoftTissue[-which(SoftTissue$PID %in% c("ID80", "ID8")),]
+SoftTissue$PID_tissue <- paste0(SoftTissue$PID, "_", SoftTissue$tissue.type)
+SoftTissue <- aggregate(SoftTissue[,1:12], by = list(SoftTissue$PID_tissue), function(x) mean(x))
+SoftTissue$tissue.type <- str_sub(SoftTissue$Group.1,-2,-1)
+
+pval_SoftTissue <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+logFC_SoftTissue <- vector(length = length(unique(sce_Tcells$Tcell_subtype)))
+celltypes <- unique(sce_Tcells$Tcell_subtype)
+names(pval_SoftTissue) <- names(logFC_SoftTissue) <- celltypes
+for (i in celltypes) {
+  pval_SoftTissue[i] <- wilcox.test(SoftTissue[which(SoftTissue$tissue.type == "PT"),i], SoftTissue[which(SoftTissue$tissue.type == "ue"),i], paired = TRUE)$p.value
+  logFC_SoftTissue[i] <- log(mean(SoftTissue[which(SoftTissue$tissue.type == "ue"),i])/mean(SoftTissue[which(SoftTissue$tissue.type == "PT"),i]))
+}
+
+pval_SoftTissue <- p.adjust(pval_SoftTissue, method = "fdr", n = length(pval_SoftTissue))
+
+```
+
+```{r myeloid}
+
+# Brain
+PID_Brain <- myeloid$PID[which(myeloid$tissue.type == "Brain")]
+PID_PT <- myeloid$PID[which(myeloid$tissue.type == "PT")]
+PID_Brain <- intersect(PID_Brain, PID_PT)
+
+Brain <- myeloid[which(myeloid$PID %in% PID_Brain & myeloid$tissue.type %in% c("PT", "Brain")),]
+Brain$PID_tissue <- paste0(Brain$PID, "_", Brain$tissue.type)
+Brain <- aggregate(Brain[,1:20], by = list(Brain$PID_tissue), function(x) mean(x))
+Brain$tissue.type <- str_sub(Brain$Group.1,-2,-1)
+
+pval_brain_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+logFC_brain_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+celltypes <- unique(sce_myeloid$celltype)[-1]
+names(pval_brain_myeloid) <- names(logFC_brain_myeloid) <- celltypes
+for (i in celltypes) {
+  pval_brain_myeloid[i] <- wilcox.test(Brain[which(Brain$tissue.type == "PT"),i], Brain[which(Brain$tissue.type == "in"),i], paired = TRUE)$p.value
+  logFC_brain_myeloid[i] <- log(mean(Brain[which(Brain$tissue.type == "in"),i])/mean(Brain[which(Brain$tissue.type == "PT"),i]))
+}
+
+pval_brain_myeloid <- p.adjust(pval_brain_myeloid, method = "fdr", n = length(pval_brain_myeloid))
+
+# Liver
+PID_Liver <- myeloid$PID[which(myeloid$tissue.type == "Liver")]
+PID_Liver <- intersect(PID_Liver, PID_PT)
+
+Liver <- myeloid[which(myeloid$PID %in% PID_Liver & myeloid$tissue.type %in% c("PT", "Liver")),]
+#Liver <- Liver[-which(Liver$PID %in% c("ID56")),]
+Liver$PID_tissue <- paste0(Liver$PID, "_", Liver$tissue.type)
+Liver <- aggregate(Liver[,1:20], by = list(Liver$PID_tissue), function(x) mean(x))
+Liver$tissue.type <- str_sub(Liver$Group.1,-2,-1)
+
+pval_liver_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+logFC_liver_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+celltypes <- unique(sce_myeloid$celltype)[-1]
+names(pval_liver_myeloid) <- names(logFC_liver_myeloid) <- celltypes
+for (i in celltypes) {
+  pval_liver_myeloid[i] <- wilcox.test(Liver[which(Liver$tissue.type == "PT"),i], Liver[which(Liver$tissue.type == "er"),i], paired = TRUE)$p.value
+  logFC_liver_myeloid[i] <- log(mean(Liver[which(Liver$tissue.type == "er"),i])/mean(Liver[which(Liver$tissue.type == "PT"),i]))
+}
+
+pval_liver_myeloid <- p.adjust(pval_liver_myeloid, method = "fdr", n = length(pval_liver_myeloid))
+
+# Bone
+PID_Bone <- myeloid$PID[which(myeloid$tissue.type == "Bone")]
+PID_Bone <- intersect(PID_Bone, PID_PT)
+
+Bone <- myeloid[which(myeloid$PID %in% PID_Bone & myeloid$tissue.type %in% c("PT", "Bone")),]
+#Bone <- Bone[-which(Bone$PID %in% c("ID69", "ID53", "ID37", "ID10", "ID63", "ID77")),]
+Bone$PID_tissue <- paste0(Bone$PID, "_", Bone$tissue.type)
+Bone <- aggregate(Bone[,1:20], by = list(Bone$PID_tissue), function(x) mean(x))
+Bone$tissue.type <- str_sub(Bone$Group.1,-2,-1)
+
+pval_bone_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+logFC_bone_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+celltypes <- unique(sce_myeloid$celltype)[-1]
+names(pval_bone_myeloid) <- names(logFC_bone_myeloid) <- celltypes
+for (i in celltypes) {
+  pval_bone_myeloid[i] <- wilcox.test(Bone[which(Bone$tissue.type == "PT"),i], Bone[which(Bone$tissue.type == "ne"),i], paired = TRUE)$p.value
+  logFC_bone_myeloid[i] <- log(mean(Bone[which(Bone$tissue.type == "ne"),i])/mean(Bone[which(Bone$tissue.type == "PT"),i]))
+}
+
+pval_bone_myeloid <- p.adjust(pval_bone_myeloid, method = "fdr", n = length(pval_bone_myeloid))
+
+# SoftTissue
+PID_SoftTissue <- myeloid$PID[which(myeloid$tissue.type == "SoftTissue")]
+PID_SoftTissue <- intersect(PID_SoftTissue, PID_PT)
+
+SoftTissue <- myeloid[which(myeloid$PID %in% PID_SoftTissue & myeloid$tissue.type %in% c("PT", "SoftTissue")),]
+#SoftTissue <- SoftTissue[-which(SoftTissue$PID %in% c("ID80", "ID8")),]
+SoftTissue$PID_tissue <- paste0(SoftTissue$PID, "_", SoftTissue$tissue.type)
+SoftTissue <- aggregate(SoftTissue, by = list(SoftTissue$PID_tissue), function(x) mean(x))
+SoftTissue$tissue.type <- str_sub(SoftTissue$Group.1,-2,-1)
+
+pval_SoftTissue_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+logFC_SoftTissue_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+celltypes <- unique(sce_myeloid$celltype)[-1]
+names(pval_SoftTissue_myeloid) <- names(logFC_SoftTissue_myeloid) <- celltypes
+for (i in celltypes) {
+  pval_SoftTissue_myeloid[i] <- wilcox.test(SoftTissue[which(SoftTissue$tissue.type == "PT"),i], SoftTissue[which(SoftTissue$tissue.type == "ue"),i], paired = TRUE)$p.value
+  logFC_SoftTissue_myeloid[i] <- log(mean(SoftTissue[which(SoftTissue$tissue.type == "ue"),i])/mean(SoftTissue[which(SoftTissue$tissue.type == "PT"),i]))
+}
+
+pval_SoftTissue_myeloid <- p.adjust(pval_SoftTissue_myeloid, method = "fdr", n = length(pval_SoftTissue_myeloid))
+
+```
+
+```{r plotting}
+
+pval_brain <- pval_brain < 0.05
+pval_bone <- pval_bone < 0.05
+pval_liver <- pval_liver < 0.05
+pval_SoftTissue <- pval_SoftTissue < 0.05
+
+pval_brain_myeloid <- pval_brain_myeloid < 0.05
+pval_bone_myeloid <- pval_bone_myeloid < 0.05
+pval_liver_myeloid <- pval_liver_myeloid < 0.05
+pval_SoftTissue_myeloid <- pval_SoftTissue_myeloid < 0.05
+
+logFC_brain <- as.data.frame(logFC_brain)
+logFC_brain$celltype <- rownames(logFC_brain)
+
+logFC_bone <- as.data.frame(logFC_bone)
+logFC_bone$celltype <- rownames(logFC_bone)
+
+logFC_liver <- as.data.frame(logFC_liver)
+logFC_liver$celltype <- rownames(logFC_liver)
+
+logFC_SoftTissue <- as.data.frame(logFC_SoftTissue)
+logFC_SoftTissue$celltype <- rownames(logFC_SoftTissue)
+
+logFC_brain_myeloid <- as.data.frame(logFC_brain_myeloid)
+logFC_brain_myeloid$celltype <- rownames(logFC_brain_myeloid)
+
+logFC_bone_myeloid <- as.data.frame(logFC_bone_myeloid)
+logFC_bone_myeloid$celltype <- rownames(logFC_bone_myeloid)
+
+logFC_liver_myeloid <- as.data.frame(logFC_liver_myeloid)
+logFC_liver_myeloid$celltype <- rownames(logFC_liver_myeloid)
+
+logFC_SoftTissue_myeloid <- as.data.frame(logFC_SoftTissue_myeloid)
+logFC_SoftTissue_myeloid$celltype <- rownames(logFC_SoftTissue_myeloid)
+
+```
+
+```{r plots}
+
+ggplot(logFC_brain[-1,], aes(x = celltype, y = logFC_brain))+
+  geom_col(aes(fill = pval_brain[-1]))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Brain")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_bone[-1,], aes(x = celltype, y = logFC_bone))+
+  geom_col(aes(fill = pval_bone[-1]))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Bone")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_liver[-1,], aes(x = celltype, y = logFC_liver))+
+  geom_col(aes(fill = pval_liver[-1]))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Liver")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_SoftTissue[-1,], aes(x = celltype, y = logFC_SoftTissue))+
+  geom_col(aes(fill = pval_SoftTissue[-1]))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("ST")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_SoftTissue_myeloid, aes(x = celltype, y = logFC_SoftTissue_myeloid))+
+  geom_col(aes(fill = pval_SoftTissue_myeloid))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("ST")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_brain_myeloid, aes(x = celltype, y = logFC_brain_myeloid))+
+  geom_col(aes(fill = pval_brain_myeloid))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Brain")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_bone_myeloid, aes(x = celltype, y = logFC_bone_myeloid))+
+  geom_col(aes(fill = pval_bone_myeloid))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Bone")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_liver_myeloid, aes(x = celltype, y = logFC_liver_myeloid))+
+  geom_col(aes(fill = pval_liver_myeloid))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Liver")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+```{r all mets T cells and myeloid cells}
+
+# T cells
+PID <- unique(sce_Tcells$Patient.ID[which(sce_Tcells$Site.of.metastasis != "Multiple" & sce_Tcells$Tissue.Type != "PT")])
+PID_PT <- unique(sce_Tcells$Patient.ID[which(sce_Tcells$Tissue.Type == "PT")])
+PID <- intersect(PID, PID_PT)
+
+M <- Tcells[which(Tcells$PID %in% PID),]
+#M <- M[-which(M$PID %in% c("ID20", "ID61", "ID74", "ID80", "ID83", "ID69", "ID53", "ID10", "ID63")),]
+M$PID_tissue <- paste0(M$PID, "_", M$tissue.type)
+M <- aggregate(M[,c(1:8,10:12)], by = list(M$PID_tissue), function(x) mean(x))
+M$tissue.type <- str_sub(M$Group.1,-2,-1)
+
+pval_M_Tcell <- vector(length = length(unique(sce_Tcells$Tcell_subtype)[-1]))
+logFC_M_Tcell <- vector(length = length(unique(sce_Tcells$Tcell_subtype)[-1]))
+celltypes <- unique(sce_Tcells$Tcell_subtype)[-1]
+names(pval_M_Tcell) <- names(logFC_M_Tcell) <- celltypes
+for (i in celltypes) {
+  pval_M_Tcell[i] <- wilcox.test(M[which(M$tissue.type == "PT"),i], M[which(M$tissue.type != "PT"),i], paired = TRUE)$p.value
+  logFC_M_Tcell[i] <- log(mean(M[which(M$tissue.type != "PT"),i])/mean(M[which(M$tissue.type == "PT"),i]))
+}
+
+pval_M_Tcell <- p.adjust(pval_M_Tcell, method = "fdr", n = length(pval_M_Tcell))
+
+# myeloids
+PID <- unique(sce_myeloid$Patient.ID[which(sce_myeloid$Site.of.metastasis != "Multiple" & sce_myeloid$Tissue.Type != "PT")])
+PID_PT <- unique(sce_myeloid$Patient.ID[which(sce_myeloid$Tissue.Type == "PT")])
+PID <- intersect(PID, PID_PT)
+
+Mm <- myeloid[which(myeloid$PID %in% PID),]
+#Mm <- Mm[-which(Mm$PID %in% c("ID12", "ID20", "ID26", "ID61", "ID69", "ID74", "ID80", "ID83", "ID53", "ID10", "ID63", "ID37", "ID56", "ID77")),]
+Mm$PID_tissue <- paste0(Mm$PID, "_", Mm$tissue.type)
+Mm <- aggregate(Mm[,1:20], by = list(Mm$PID_tissue), function(x) mean(x))
+Mm$tissue.type <- str_sub(Mm$Group.1,-2,-1)
+
+pval_M_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+logFC_M_myeloid <- vector(length = length(unique(sce_myeloid$celltype)[-1]))
+celltypes <- unique(sce_myeloid$celltype)[-1]
+names(pval_M_myeloid) <- names(logFC_M_myeloid) <- celltypes
+for (i in celltypes) {
+  pval_M_myeloid[i] <- wilcox.test(Mm[which(Mm$tissue.type == "PT"),i], Mm[which(Mm$tissue.type != "PT"),i], paired = TRUE)$p.value
+  logFC_M_myeloid[i] <- log(mean(Mm[which(Mm$tissue.type != "PT"),i])/mean(Mm[which(Mm$tissue.type == "PT"),i]))
+}
+
+pval_M_myeloid <- p.adjust(pval_M_myeloid, method = "fdr", n = length(pval_M_myeloid))
+
+
+# immune
+sce_Tcells$type <- sce_Tcells$celltype
+sce_Tcells$type[which(sce_Tcells$type %in% Tcell_clusters)] <- "T_cell"
+sce_Tcells$type[which(sce_Tcells$type %in% c("neutrophil", "HLA-DR_high"))] <- "myeloid"
+
+Immune_cells <- as.data.frame(unclass(table(sce_Tcells$file, sce_Tcells$type)))
+tissue <- distinct(as.data.frame(colData(sce_Tcells)[,c("file", "Tissue.Type", "Patient.ID", "ROI")]))
+Immune_cells$tissue.type <- tissue$Tissue.Type
+Immune_cells$PID <- tissue$Patient.ID
+Immune_cells$ROI <- tissue$ROI
+Immune_cells$area <- vector[rownames(Immune_cells)]
+
+for(i in unique(sce_Tcells$type)[1:9]){
+  Immune_cells[,i] <- Immune_cells[,i]/Immune_cells$area
+}
+
+
+PID <- unique(sce_Tcells$Patient.ID[which(sce_Tcells$Site.of.metastasis != "Multiple" & sce_Tcells$Tissue.Type != "PT")])
+PID_PT <- unique(sce_Tcells$Patient.ID[which(sce_Tcells$Tissue.Type == "PT")])
+PID <- intersect(PID, PID_PT)
+
+Immune <- Immune_cells[which(Immune_cells$PID %in% PID),]
+Immune$PID_tissue <- paste0(Immune$PID, "_", Immune$tissue.type)
+Immune <- aggregate(Immune, by = list(Immune$PID_tissue), function(x) mean(x))
+Immune$tissue.type <- str_sub(Immune$Group.1,-2,-1)
+
+pval_Immune <- vector(length = length(unique(sce_Tcells$type)[c(1,5,6,7,9)]))
+logFC_Immune <- vector(length = length(unique(sce_Tcells$type)[c(1,5,6,7,9)]))
+celltypes <- unique(sce_Tcells$type)[c(1,5,6,7,9)]
+names(pval_Immune) <- names(logFC_Immune) <- celltypes
+for (i in celltypes) {
+  pval_Immune[i] <- wilcox.test(Immune[which(Immune$tissue.type == "PT"),i], Immune[which(Immune$tissue.type != "PT"),i], paired = TRUE)$p.value
+  logFC_Immune[i] <- log(mean(Immune[which(Immune$tissue.type != "PT"),i])/mean(Immune[which(Immune$tissue.type == "PT"),i]))
+}
+
+pval_Immune <- p.adjust(pval_Immune, method = "fdr", n = length(pval_Immune))
+
+
+pval_Immune <- pval_Immune < 0.05
+pval_M_myeloid <- pval_M_myeloid < 0.05
+pval_M_Tcell <- pval_M_Tcell < 0.05
+
+logFC_Immune <- as.data.frame(logFC_Immune)
+logFC_Immune$celltype <- rownames(logFC_Immune)
+
+logFC_M_myeloid <- as.data.frame(logFC_M_myeloid)
+logFC_M_myeloid$celltype <- rownames(logFC_M_myeloid)
+
+logFC_M_Tcell <- as.data.frame(logFC_M_Tcell)
+logFC_M_Tcell$celltype <- rownames(logFC_M_Tcell)
+
+
+ggplot(logFC_Immune, aes(x = celltype, y = logFC_Immune))+
+  geom_col(aes(fill = pval_Immune))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Immune")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_M_myeloid, aes(x = celltype, y = logFC_M_myeloid))+
+  geom_col(aes(fill = pval_M_myeloid))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Myeloids")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+ggplot(logFC_M_Tcell, aes(x = celltype, y = logFC_M_Tcell))+
+  geom_col(aes(fill = pval_M_Tcell))+
+  scale_fill_manual(values = c("grey", "grey15"))+
+  labs(y=paste0("logFC"), x="Community")+
+  coord_flip() +
+  ggtitle("Immune")+
+  labs(fill="significant") +
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+
+
+```{r}
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("PT") & sce_Tcells$Patient.ID %in% PID_Bone)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("Bone") & sce_Tcells$Patient.ID %in% PID_Bone)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("PT") & sce_Tcells$Patient.ID %in% PID_Brain)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("Brain") & sce_Tcells$Patient.ID %in% PID_Brain)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("PT") & sce_Tcells$Patient.ID %in% PID_Liver)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("Liver") & sce_Tcells$Patient.ID %in% PID_Liver)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("PT") & sce_Tcells$Patient.ID %in% PID_SoftTissue)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+plotSpatial(sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("SoftTissue") & sce_Tcells$Patient.ID %in% PID_SoftTissue)],
+            img_id = "ImageNumber",
+            coords = c("Center_X", "Center_Y"),
+            node_size_fix = 0.1,
+            draw_edges = FALSE,
+            node_color_by = "type") +
+  scale_color_manual(values = c("darkgreen", "grey", "grey", "purple3", "seagreen", "turquoise", "grey", "green3", "grey"))
+
+```
+
+

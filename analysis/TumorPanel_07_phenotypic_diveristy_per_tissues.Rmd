@@ -1,0 +1,675 @@
+---
+title: "TumorPanel_07_phenotypic_diveristy_per_tissues"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+## Introduction
+
+This script plots analysis for the diversity measures for comparing different tissues and moelecular subtypes
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(compositions)
+library(vegan)
+library(ComplexHeatmap)
+
+# Read SingleCellExperiment object
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1","Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7", 
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1")
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce1 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+#filter only patients with matched samples
+sce2 <-filterSCE(sce1, matched_samples==1)
+#Check number of cells per patient sample:
+counts_per_sample <- table(sce2$sample_type, sce2$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<200)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+unique(sce2$Site.of.metastasis[sce2$Patient.ID %in% patient_to_exclude])
+
+sce <- filterSCE(sce2, !(sce2$Patient.ID %in% patient_to_exclude))
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+#Repeat tissue type as condition for plotting functions in CATALYST
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$condition <- factor(sce$Tissue.Type)
+sce$Patient.ID <- factor(sce$Patient.ID)
+sce$Location <- factor(sce$Location)
+sce$Age.delta <- as.numeric(sce$Age.delta)
+sce$agedeltaGroup[sce$Age.delta < 6] <- "AgeDelta<5"
+sce$agedeltaGroup[sce$Age.delta > 5] <- "AgeDelta>5"
+sce$agedeltaGroup <- factor(sce$agedeltaGroup)
+
+colSums(table(sce$Patient.ID,sce$Site.of.metastasis)!=0)
+colSums(table(sce$Patient.ID,sce$Tissue.Type)!=0)
+colSums(table(sce$Patient.ID,sce$molecular.subtype)!=0)
+```
+
+```{r diversity-metadata}
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+```
+### PCA plot over cluter abundances for primary tumor only
+
+```{r pca-tumor-phenotypes}
+#big flowSOM clusters
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce$condition <- factor(sce$Site.of.metastasis)
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FF8000","#AC16AC","#FF3333","#4C9900","#CCCC00"), arrows= TRUE)
+
+sce_filtered$condition <- factor(sce_filtered$molecular.subtype)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FC4E07","#E7B800","#00AFBB","gray"), arrows= TRUE)
+```
+
+
+# Test if tumor cells are more similar based on a tissue type:
+
+```{r permanova-primary-tumors-site-of-metastasis}
+
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+# Run anosim on PT samples
+sce_filtered <- filterSCE(sce, sample_type =="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+tbl_counts <- t(abundances_per_patient_met)
+tbl_counts_sub <- tbl_counts[!rowSums(tbl_counts, na.rm = TRUE) == 0,]
+tbl_counts_sub <- tbl_counts_sub[rownames(tbl_counts_sub) %in% diversity_metadata$Patient.ID,]
+
+
+tbl_grouping_full <- diversity_metadata[c("Patient.ID","Site.of.metastasis", "molecular.subtype")]
+tbl_grouping<- tbl_grouping_full[tbl_grouping_full$Patient.ID %in% rownames(tbl_counts_sub),]
+target<- rownames(tbl_counts_sub)
+tbl_grouping <- tbl_grouping[match(target, tbl_grouping$Patient.ID),]
+
+## on L2 distance
+y_met = t(fq_per_patient_met)
+f <- log(prop.table(y_met + 1, 1), 2)
+tbl_counts_tf <- f-rowMeans(f)
+
+tbl_counts_sub <- tbl_counts_tf[!rowSums(tbl_counts, na.rm = TRUE) == 0,]
+tbl_counts_sub <- tbl_counts_sub[rownames(tbl_counts_sub) %in% diversity_metadata$Patient.ID,]
+
+
+tbl_grouping_full <- diversity_metadata[c("Patient.ID","Site.of.metastasis", "molecular.subtype")]
+
+tbl_grouping<- tbl_grouping_full[tbl_grouping_full$Patient.ID %in% rownames(tbl_counts_sub),]
+target<- rownames(tbl_counts_sub)
+tbl_grouping <- tbl_grouping[match(target, tbl_grouping$Patient.ID),]
+
+dist <- vegdist(tbl_counts_sub,method = 'euclidean', na.rm = TRUE)
+
+
+mod_tissue <- betadisper(dist, tbl_grouping$Site.of.metastasis, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+
+mode_subtype <- betadisper(dist, tbl_grouping$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+
+### check if dispersions are significantly different in the groups
+permutest(mod_tissue, pairwise = TRUE, permutations = 999)
+
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+```
+
+
+```{r permanova-primary-tumors}
+adonis(dist ~molecular.subtype*Site.of.metastasis,  data=tbl_grouping, permutations=999)
+
+#check for pairwise significance
+#library(devtools)
+#install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+library(cluster)
+library(pairwiseAdonis)
+pairwise.adonis(dist,tbl_grouping$Site.of.metastasis,p.adjust.m= 'BH')
+pairwise.adonis(dist,tbl_grouping$molecular.subtype,p.adjust.m= 'BH')
+
+```
+
+
+### PCA plot over cluter abundances for metastatic samples only
+
+```{r pca-tumor-phenotypes-metastatic-sites}
+#big flowSOM clusters
+sce_filtered1 <- filterSCE(sce,Tissue.Type!="PT")
+sce_filtered <- filterSCE(sce_filtered1,Site.of.metastasis!="Multiple")
+
+sce_filtered$condition <- factor(sce_filtered$Tissue.Type)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= TRUE)
+
+sce_filtered$condition <- factor(sce_filtered$molecular.subtype)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FC4E07","#E7B800","#00AFBB","gray"), arrows= TRUE)
+```
+
+
+# Test if metastatic sites are different based on tissue type or molecular subtype
+```{r}
+# Run anosim on Met samples
+sce_filtered1 <- filterSCE(sce, sample_type =="M")
+sce_filtered <- filterSCE(sce_filtered1, Site.of.metastasis !="Multiple")
+
+sce_filtered$cluster_id <- sce_filtered$flowSOM_big_clusters
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),5)
+tbl_counts <- t(abundances_per_patient_met)
+tbl_counts_sub <- tbl_counts[!rowSums(tbl_counts, na.rm = TRUE) == 0,]
+tbl_counts_sub <- tbl_counts_sub[rownames(tbl_counts_sub) %in% diversity_metadata$Patient.ID,]
+
+
+tbl_grouping_full <- diversity_metadata[c("Patient.ID","Site.of.metastasis", "molecular.subtype")]
+tbl_grouping<- tbl_grouping_full[tbl_grouping_full$Patient.ID %in% rownames(tbl_counts_sub),]
+target<- rownames(tbl_counts_sub)
+tbl_grouping <- tbl_grouping[match(target, tbl_grouping$Patient.ID),]
+
+## on L2 distance
+y_met = t(fq_per_patient_met)
+f <- log(prop.table(y_met + 1, 1), 2)
+tbl_counts_tf <- f-rowMeans(f)
+
+
+tbl_counts_sub <- tbl_counts_tf[!rowSums(tbl_counts, na.rm = TRUE) == 0,]
+tbl_counts_sub <- tbl_counts_sub[rownames(tbl_counts_sub) %in% diversity_metadata$Patient.ID,]
+
+
+tbl_grouping_full <- diversity_metadata[c("Patient.ID","Site.of.metastasis", "molecular.subtype")]
+
+tbl_grouping<- tbl_grouping_full[tbl_grouping_full$Patient.ID %in% rownames(tbl_counts_sub),]
+target<- rownames(tbl_counts_sub)
+tbl_grouping <- tbl_grouping[match(target, tbl_grouping$Patient.ID),]
+
+dist <- vegdist(tbl_counts_sub,method = 'euclidean', na.rm = TRUE)
+
+mod_tissue <- betadisper(dist, tbl_grouping$Site.of.metastasis, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+
+mode_subtype <- betadisper(dist, tbl_grouping$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+
+### check if dispersions are different
+permutest(mod_tissue, pairwise = TRUE, permutations = 999)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+```
+
+
+```{r permanova-metastatic-sites-only}
+adonis(dist ~molecular.subtype*Site.of.metastasis,  data=tbl_grouping, permutations=999)
+#pairwise significance
+pairwise.adonis(dist,tbl_grouping$Site.of.metastasis,p.adjust.m= 'BH')
+pairwise.adonis(dist,tbl_grouping$molecular.subtype,p.adjust.m= 'BH')
+
+```
+
+### Are metastatic tumors more heterogeneous based on the tissue type 
+
+```{r heterogeneity-metastasis-tissue-sites}
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=shannon_met)) +
+    geom_boxplot(outlier.shape = NA) +  scale_y_continuous(breaks = round(seq(0, 3, by = 0.2),1))+
+    geom_jitter(color="darkblue", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=12),text = element_text(size=15)
+    )  +
+    xlab("") + ylab("Shannon index")
+
+
+vars <- c( 'Site.of.metastasis','shannon_met')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(shannon_met ~ Site.of.metastasis, data = my_dat)
+
+```
+
+
+### Are metastatic tumors more similar to their primary based on site of metastasis or molecular subtype 
+
+```{r abundance-similarity-tissue-sites}
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=L2_transformed)) +
+    geom_boxplot(outlier.shape = NA, ) + scale_y_continuous(breaks = round(seq(0,20, by = 2),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=15)
+    )  +
+    xlab("") + ylab("Aitchison distance")
+
+vars <- c( 'Site.of.metastasis','L2_transformed')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(L2_transformed ~ Site.of.metastasis, data = my_dat)
+
+
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=L1_proportions)) +
+    geom_boxplot(outlier.shape = NA, ) +scale_y_continuous(breaks = round(seq(0, 2, by = 0.2),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=18)
+    ) +xlab("") + ylab("Manhattan distance")
+
+vars <- c( 'Site.of.metastasis','L1_proportions')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(L1_proportions ~ Site.of.metastasis, data = my_dat)
+
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=jaccard)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 2, by = 0.1),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=18)
+    )  +
+    xlab("") + ylab("Jaccard index")
+
+vars <- c( 'Site.of.metastasis','jaccard')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(jaccard ~ Site.of.metastasis, data = my_dat)
+
+```
+
+```{r abundance-similarity-molecular-subtype}
+
+diversity_metadata %>% ggplot( aes(x=molecular.subtype, y=L2_transformed)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(0, 20, by = 2),1)) +
+    geom_jitter(color="navy", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=18)
+    ) +
+    xlab("")
+
+vars <- c( 'molecular.subtype','L2_transformed')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(L2_transformed ~ molecular.subtype, data = my_dat)
+pairwise.wilcox.test(diversity_metadata$L2_transformed, diversity_metadata$molecular.subtype,
+                 p.adjust.method = "BH")
+
+```
+
+
+### Compare diversity measures for different primary tumor locations
+
+### Metastatic similarity to different tumor locations
+
+```{r similarity-measures-primary-tumor-locations}
+
+df_paired <- diversity_metadata[c("Patient.ID","L2_transformed_margin", "L2_transformed_stromal", "L2_transformed_intra", "L2_transformed")]
+df_paired_na <- df_paired[complete.cases(df_paired), ]
+rownames(df_paired_na) <- df_paired_na$Patient.ID
+df_paired_na <- df_paired_na[,-c(1)]
+colnames(df_paired_na) <- c("Margin", "Stromal", "Intratumoral", "All together")
+boxplot(df_paired_na,lwd = 1.5, ylab = 'Aitchison distance', col="white")
+stripchart(df_paired_na, vertical = TRUE, method = "jitter", add = TRUE, pch = 20, col = 'navy')
+
+```
+
+
+### Heterogeneity
+
+### Compare heterogeneity of primary tumors and metastatic samples
+
+```{r heterogeneity-pairwise-primary-vs-met-samples}
+
+df_paired <- diversity_metadata[c("Patient.ID","shannon_pt", "shannon_met")]
+df_paired <- reshape2::melt(df_paired, id = "Patient.ID")
+
+ggpaired(df_paired, x = "variable", y = "value",
+         color = "variable", line.color = "gray", line.size = 0.4,
+         palette = "jco")+ stat_compare_means(paired = TRUE)
+
+```
+
+### Do more heterogeneous primary tumors seed more heterogenous metastasis
+
+```{r primary-L2_transformed-PT-met}
+
+sp <- ggscatter(diversity_metadata, x = "shannon_pt", y = "shannon_met",
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )
+# Add correlation coefficient
+sp + stat_cor(method = "pearson", size =8) #, label.x = 3, label.y = 30)
+```
+
+
+
+
+### Example images for patients with very similar and very different cluster composition between the sites
+
+```{r example-images-cluster-frequencies}
+sce$cluster_id <- factor(as.character(sce$flowSOM_big_clusters))
+
+library(cytomapper)
+
+path.to.images <- "data/example_tumor_masks/"
+all_masks <- loadImages(path.to.images, pattern = "_mask.tiff")
+all_masks
+
+#Add image number
+mcols(all_masks)$ROI_ID <-c("TMA265_ROI_n09_tumor","TMA265_ROI_n10_tumor","TMA265_ROI_f14_tumor","TMA265_ROI_n16_tumor",
+                            "TMA265_ROI_f15_tumor", "TMA265_ROI_f19_tumor","TMA265_ROI_f20_tumor", "TMA265_ROI_c22_tumor")
+# Scale images
+all_masks <- scaleImages(all_masks, 2^16-1)
+
+cl_colors = list(cluster_id = c(
+    "1"= "#DC050C", "10"="#FB8072","11"="#1965B0", "12"="#7BAFDE", "13"="#882E72",
+    "14"="#B17BA6", "15"="#FF7F00", "16"="#FDB462", "17"="#E7298A","18"= "#E78AC3",
+    "19"="#33A02C", "2"="#B2DF8A", "20"="#55A1B1", "3"="#8DD3C7","4"="#A6761D",
+    "5"= "#E6AB02", "6"="#7570B3", "7"="#BEAED4", "8"="#a30093", "9"="#fafafa"))
+
+#bone
+cur_img <- getImages(all_masks, "20200726_ZTMA_265_tumor_rows_08_14_s0_a25_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+#bone
+cur_img <- getImages(all_masks, "20200726_ZTMA_265_tumor_rows_08_14_s0_a39_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+#PT
+cur_img <- getImages(all_masks, "20200728_ZTMA_265_tumor_rows_15_21_s0_a27_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+
+cur_img <- getImages(all_masks, "20200728_ZTMA_265_tumor_rows_15_21_s0_a4_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+cur_img <- getImages(all_masks, "20200728_ZTMA_265_tumor_rows_15_21_s0_a77_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+cur_img <- getImages(all_masks, "20200728_ZTMA_265_tumor_rows_15_21_s0_a64_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+cur_img <- getImages(all_masks, "20200726_ZTMA_265_tumor_rows_08_14_s0_a96_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "cluster_id",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+```
+
+
+
+### Plot heatmap, PCA and distance measures for alternative clustering approaches - KMEANS
+
+### Heatmap for phenotypic clusters
+
+```{r heatmap-median-expression-tumor-phenotypes-kmeans, fig.width=15, fig.height=10}
+
+sce1$cluster_id <-sce1$kmeans_clusters
+metadata(sce1)$cluster_codes <- data.frame(custom = factor(levels(sce1$cluster_id)), levels = levels(sce1$cluster_id))
+
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+```
+
+
+### PCA plot over cluter abundances
+
+```{r pca-tumor-phenotypes-kmeans}
+#big flowSOM clusters
+sce$cluster_id <- sce$kmeans_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce$condition <- factor(sce$Tissue.Type)
+
+clrDR(sce, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= FALSE)
+```
+
+
+```{r diversity-metadata-kmeans}
+diversity_metadata <- read.csv("data/patient_metadata_kmeans.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+```
+
+
+### Are metastatic tumors more similar to their primary based on site of metastasis or molecular subtype 
+
+```{r abundance-similarity-tissue-sites-kmeans}
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=L2_transformed)) +
+    geom_boxplot(outlier.shape = NA, ) + scale_y_continuous(breaks = round(seq(0, 25, by = 2),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=15)
+    )  +
+    xlab("") + ylab("Aitchison distance")
+
+vars <- c( 'Site.of.metastasis','L2_transformed')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(L2_transformed ~ Site.of.metastasis, data = my_dat)
+
+pairwise.wilcox.test(diversity_metadata$L2_transformed, diversity_metadata$Site.of.metastasis,
+                 p.adjust.method = "BH")
+```
+
+### Compare heterogeneity of primary tumors and metastatic samples
+
+```{r heterogeneity-pairwise-primary-vs-met-samples-kmeans}
+
+df_paired <- diversity_metadata[c("Patient.ID","shannon_pt", "shannon_met")]
+df_paired <- reshape2::melt(df_paired, id = "Patient.ID")
+
+ggpaired(df_paired, x = "variable", y = "value",
+         color = "variable", line.color = "gray", line.size = 0.4,
+         palette = "jco")+ stat_compare_means(paired = TRUE)
+
+```
+
+```{r primary-met-correlation-heterogeneity-kmeans}
+
+sp <- ggscatter(diversity_metadata, x = "shannon_pt", y = "shannon_met",
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )
+# Add correlation coefficient
+sp + stat_cor(method = "pearson", size =8) #, label.x = 3, label.y = 30)
+```
+
+
+
+### PCA plot over cluter abundances for metastatic samples only
+
+```{r pca-tumor-phenotypes-kmeans}
+#big flowSOM clusters
+sce_filtered1 <- filterSCE(sce,Tissue.Type!="PT")
+sce_filtered <- filterSCE(sce_filtered1,Site.of.metastasis!="Multiple")
+
+sce_filtered$condition <- factor(sce_filtered$Tissue.Type)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= FALSE)
+
+sce_filtered$condition <- factor(sce_filtered$molecular.subtype)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FC4E07","#E7B800","#00AFBB","gray"), arrows= FALSE)
+```
+
+
+### Plot heatmap, PCA and distance measures for alternative clustering approaches - Phenograph
+
+### Heatmap for phenotypic clusters
+
+```{r heatmap-median-expression-tumor-phenotypes-graph-based, fig.width=15, fig.height=10}
+
+sce1$cluster_id <-sce1$epithelial_phenograph_clusters
+metadata(sce1)$cluster_codes <- data.frame(custom = factor(levels(sce1$cluster_id)), levels = levels(sce1$cluster_id))
+
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+```
+
+
+### PCA plot over cluter abundances
+
+```{r pca-tumor-phenotypes-graph-based}
+sce$cluster_id <- sce$epithelial_phenograph_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce$condition <- factor(sce$Tissue.Type)
+
+clrDR(sce, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= FALSE)
+```
+
+
+```{r diversity-metadata-graph-based}
+diversity_metadata <- read.csv("data/patient_metadata_graph_based.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+```
+
+
+### Are metastatic tumors more similar to their primary based on site of metastasis or molecular subtype 
+
+```{r abundance-similarity-tissue-sites-graph-based}
+
+diversity_metadata %>% ggplot( aes(x=Site.of.metastasis, y=L2_transformed)) +
+    geom_boxplot(outlier.shape = NA, ) + scale_y_continuous(breaks = round(seq(0, 25, by = 2),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=20),text = element_text(size=15)
+    )  +
+    xlab("") + ylab("Aitchison distance")
+
+vars <- c( 'Site.of.metastasis','L2_transformed')
+my_dat <- diversity_metadata[vars]
+rownames(my_dat) <- diversity_metadata$Patient.ID
+kruskal.test(L2_transformed ~ Site.of.metastasis, data = my_dat)
+
+pairwise.wilcox.test(diversity_metadata$L2_transformed, diversity_metadata$Site.of.metastasis,
+                 p.adjust.method = "BH")
+```
+
+### Compare heterogeneity of primary tumors and metastatic samples
+
+```{r heterogeneity-pairwise-primary-vs-met-samples-graph-based}
+
+df_paired <- diversity_metadata[c("Patient.ID","shannon_pt", "shannon_met")]
+df_paired <- reshape2::melt(df_paired, id = "Patient.ID")
+
+ggpaired(df_paired, x = "variable", y = "value",
+         color = "variable", line.color = "gray", line.size = 0.4,
+         palette = "jco")+ stat_compare_means(paired = TRUE)
+
+```
+
+```{r primary-met-correlation-heterogeneity-graph-based}
+
+sp <- ggscatter(diversity_metadata, x = "shannon_pt", y = "shannon_met",
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )
+# Add correlation coefficient
+sp + stat_cor(method = "pearson", size =8) #, label.x = 3, label.y = 30)
+```
+
+
+
+### PCA plot over cluter abundances for metastatic samples only
+
+```{r pca-tumor-phenotypes-graph-based}
+sce_filtered1 <- filterSCE(sce,Tissue.Type!="PT")
+sce_filtered <- filterSCE(sce_filtered1,Site.of.metastasis!="Multiple")
+
+sce_filtered$condition <- factor(sce_filtered$Tissue.Type)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= FALSE)
+
+sce_filtered$condition <- factor(sce_filtered$molecular.subtype)
+clrDR(sce_filtered, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#FC4E07","#E7B800","#00AFBB","gray"), arrows= FALSE)
+```
+
+

@@ -1,0 +1,575 @@
+---
+title: "Untitled"
+author: "Alina Bollhagen"
+date: "2023-03-30"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r Library and data loading}
+
+# Load libraries
+library(SingleCellExperiment)
+library(tidyverse)
+library(imcRtools)
+library(pheatmap)
+library(viridis)
+library(edgeR)
+library(BiocParallel)
+library(igraph)
+library(corrr)
+library(ggraph)
+library(spicyR)
+library(ggplot2)
+library(ComplexHeatmap)
+library(ade4)
+library(circlize)
+
+# Read SingleCellExperiment objects
+sce_tumor <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/tumor/tumorSCE_initial_clustered_with_tumor_clusters.rds")
+sce_Tcells <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_myeloid <- readRDS("/Volumes/G_DQBM_BB_Central$/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+
+sce_tumor$ROI <- substr(sce_tumor$ROI_ID, 1,14)
+sce_Tcells$ROI <- substr(sce_Tcells$ROI_ID, 1,14)
+sce_myeloid$ROI <- substr(sce_myeloid$ROI_ID, 1,14)
+
+# Extract epithelial, endothelial, B cells and stroma from tumor SCE, T cells and myeloid cells
+sce_tumor <- sce_tumor[,which(sce_tumor$celltype %in% c("Epithelial", "Endothelial", "Stroma"))]
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$celltype %in% c("NK_cell", "T_cell", "plasma_cell", "B_cell"))]
+sce_Tcells <- sce_Tcells[,-which(sce_Tcells$celltype == "T_cell" & sce_Tcells$Tcell_subtype == "none")]
+sce_myeloid <- sce_myeloid[,which(!(sce_myeloid$M_cluster %in% "none"))]
+
+# Name tumor clusters
+tumor_clusters <- tumor_clusters <- c("CK+ HER2+", "CK+ HR+ 1", "CK+ mTOR+", "CK+ HRhigh","EGFR+ hypoxic", 
+                    "CK7+ CK+", "CK+ HR+ 2", "anti-apoptotic", "EGFR+ p53+", "proliferative", 
+                    "immune-evasive", "CKlow HR+", "apoptotic", "hypoxic", "myoepithelial", 
+                    "CK+ HRlow", "HLA-ABC+ basal", "basal", "CKlow HER2+", "epitheliallow")
+names(tumor_clusters) <- as.character(c(1:20))
+
+cols_tumor_clusters <- c("#680C07", "#BC544B", "#CC0000", "#9B2D1F", "#4E0707", 
+                         "#D34817", "#FF6600", "#FA8128", "#FCAE1E", "#B56727",
+                         "#80400B", "#D67229", "#330000", "#E3B778", "#FAE29C",
+                         "#FDD0A2", "#C9BB8E", "#918485", "#FF3333", "#993300")
+
+# Name myeloid clusters
+myeloid_clusters <- c("ARG1+ myeloid", "ap myeloid", "proliferative myeloid", "pro-inflammatory macrophages", 
+                      "IDO+ myeloid", "immunomod. macrophages 1", "myeloid", "MMP9+ macrophages",
+                      "monocytes", "STING+ myeloid", "cDC1", "activated myeloid",
+                      "immunomod. macrophages 2", "activated monocytes", "PD-L1+ hypoxic myeloid", "immunomod. macrophages 3",
+                      "moDC", "LAMP3 DC", "neutrophils", "pDC")
+names(myeloid_clusters) <- c("M_c1", "M_c2", "M_c3", "M_c4", 
+                             "M_c5", "M_c6", "M_c7", "M_c8", 
+                             "M_c9", "M_c10", "M_c11", "M_c12", 
+                             "M_c13", "M_c14", "M_c15", "M_c16", "M_c17",
+                             "LAMP3_DC", "neutrophil", "pDC")
+
+cols_myeloid_clusters <- c("#663399", "#6600CC", "#330099", "#333366", 
+                           "#9933FF", "#666699", "#333399", "#6666CC",
+                           "#3333CC", "#6666FF", "#3399FF", "#33CCFF",
+                           "#66CCFF", "#6699FF", "#3366FF", "#00CCFF",
+                           "#0099FF", "#0066FF", "#000066", "#003366")
+                           
+names(cols_myeloid_clusters) <- myeloid_clusters
+                           
+# Name T cell clusters
+
+immune_clusters <- c("B cells", "NK cells", "plasma cells")
+names(immune_clusters) <- c("B_cell", "NK_cell", "plasma_cell")
+cols_immune_clusters <- c("#003300", "#006633", "#009966")
+names(cols_immune_clusters) <- immune_clusters
+
+Tcell_clusters <- c("exhausted CD8 T cell", "Treg", "TCF7+ CD4 T cell", "CD4 Thelper cells",
+                    "developing Treg", "effector CD8 T cell", "Tfh", "TCF7+ CD8 T cell", "cytotoxic CD8 T cell", 
+                    "CD7 CD8 T cell", "activated CD8 T cell")
+
+names(Tcell_clusters) <- c("CD8_exhausted", "Treg", "CD4_TCF7-high", "CD4_Thelper", 
+                           "Treg-developing", "CD8_effector", "Tfh", "CD8_TCF7-high", 
+                           "CD8_GZMB-high", "CD8_CD7-high", "CD8_activated")
+
+cols_Tcell_clusters <- c("#33CC00", "#00CC33", "#339900", "#006600",
+                         "#009933", "#336633", "#00FF66", "#00CC00",
+                         "#669966", "#009900", "#99FF00")
+
+names(cols_Tcell_clusters) <- Tcell_clusters
+
+# Adapt cluster names
+sce_tumor$celltype[which(sce_tumor$cell_class == "epithelial")] <- tumor_clusters[sce_tumor$celltypeTumorClusters[which(sce_tumor$cell_class == "epithelial")]]
+sce_Tcells$celltype[which(sce_Tcells$celltype == "T_cell")] <- Tcell_clusters[sce_Tcells$Tcell_subtype[which(sce_Tcells$celltype == "T_cell")]]
+sce_myeloid$celltype <- myeloid_clusters[sce_myeloid$M_cluster]
+
+# Select intratumoral regions
+sce_tumor <- sce_tumor[,which(sce_tumor$Location == "intratumoral")]
+sce_Tcells <- sce_Tcells[,which(sce_Tcells$Location == "intratumoral")]
+sce_myeloid <- sce_myeloid[,which(sce_myeloid$Location == "intratumoral")]
+
+sce_tumor$imageCellID <- sce_tumor$cellID
+sce_tumor$cellID <- NULL
+
+sce_Tcells$imageCellID <- sce_Tcells$cellID
+sce_Tcells$cellID <- NULL
+
+sce_myeloid$imageCellID <- sce_myeloid$cellID
+sce_myeloid$cellID <- NULL
+
+```
+
+```{r Perform cluster sweep}
+
+# Perform cluster sweep
+set.seed(220427)
+clust_PID <- lapply(2:30, function(k){
+  cur_km <- kmeans(cprops, centers = k, iter.max = 50, nstart = 20)
+  return(list(wss = cur_km$tot.withinss,
+           clusters = cur_km$cluster))
+})
+
+sil_60 <- vapply(lapply(clust_PID, `[[`, 2), 
+              function(x) mean(approxSilhouette(cprops, x)$width), 
+              0)
+
+
+# can be between -1 and 1 with 1 being optimal
+ggplot(data.frame(k = rep(2:30, 3),
+                  sil = sil_60)) +
+    geom_point(aes(k, sil)) +
+    theme_classic(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab("Cluster parameter combination") +
+    ylab("Average silhouette width")
+
+# measures compactness of a cluster, as small as possible
+ggplot(data.frame(k = rep(2:30, 3),
+                  wss = sapply(clust_PID, `[[`, 1))) +
+    geom_point(aes(k, wss)) +
+    theme_classic(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab("Cluster parameter combination") +
+    ylab("Total within cluster sum of squares")
+
+```
+
+```{r assigning metaclusters}
+
+# order is from top to bottom (based on other script from Laura)
+order <- c("ID32", "ID27", "ID13", "ID3",  "ID70", "ID37", "ID48", "ID43", 
+           "ID10", "ID85", "ID47", "ID34", "ID55", "ID16", "ID46", "ID58", 
+           "ID44", "ID56", "ID81", "ID6",  "ID41", "ID52", "ID14", "ID28", 
+           "ID50", "ID45", "ID5",  "ID9",  "ID23", "ID7",  "ID40", "ID60", 
+           "ID51", "ID33", "ID17", "ID22", "ID73", "ID42", "ID15", "ID68", 
+           "ID29", "ID86", "ID84", "ID2",  "ID21", "ID67", "ID4",  "ID57", 
+           "ID69", "ID38", "ID76", "ID71", "ID8",  "ID39", "ID54", "ID31", 
+           "ID59", "ID87", "ID66", "ID11", "ID64", "ID19", "ID18", "ID79", 
+           "ID88", "ID30", "ID65", "ID25", "ID24", "ID49", "ID72", "ID36", 
+           "ID78")
+
+metacluster <- c(rep("1",11), rep("2",6), rep("3",2), rep("4", 1), rep("5",4), rep("6",5),
+                 rep("7",3), rep("8",7), rep("9",13), rep("10",2), rep("11",5),
+                 rep("12",8), rep("13",5), rep("14",1))
+names(metacluster) <- order
+
+```
+
+```{r Differential abundance for myeloid cells}
+
+myeloids <- sce_myeloid[,which(sce_myeloid$Tissue.Type %in% c("PT"))]
+myeloids$metacluster <- metacluster[myeloids$Patient.ID]
+myeloids <- myeloids[,which(myeloids$metacluster != "NA")]
+myeloids <- myeloids[,which(!(myeloids$celltype %in% "ARG1+ myeloid"))]
+  
+# Prepare abundance object
+abundances <- table(myeloids$celltype, myeloids$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(myeloids)[match(colnames(abundances), myeloids$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+# For a specific tissue type
+myeloid_logFC_PT <- as.data.frame(matrix(nrow = length(unique(sce_myeloid$celltype)), ncol =14))
+rownames(myeloid_logFC_PT) <- unique(sce_myeloid$celltype)
+myeloid_sig_PT <- as.data.frame(matrix(nrow = length(unique(sce_myeloid$celltype)), ncol =14))
+rownames(myeloid_sig_PT) <- unique(sce_myeloid$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+myeloid_logFC_PT[,i] <- DA[rownames(myeloid_logFC_PT), "logFC"]
+myeloid_sig_PT[,i] <- DA[rownames(myeloid_logFC_PT), "PValue"]
+  
+}
+
+
+### metastases
+
+myeloids <- sce_myeloid[,which(sce_myeloid$Tissue.Type %in% c("SoftTissue", "Brain", "Liver", "Bone"))]
+myeloids$metacluster <- metacluster[myeloids$Patient.ID]
+myeloids <- myeloids[,which(myeloids$metacluster != "NA")]
+#myeloids <- myeloids[,which(!(myeloids$celltype %in% "ARG1 myeloid"))]
+  
+# Prepare abundance object
+abundances <- table(myeloids$celltype, myeloids$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(myeloids)[match(colnames(abundances), myeloids$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+# For a specific tissue type
+myeloid_logFC_M <- as.data.frame(matrix(nrow = length(unique(sce_myeloid$celltype)), ncol =14))
+rownames(myeloid_logFC_M) <- unique(sce_myeloid$celltype)
+myeloid_sig_M <- as.data.frame(matrix(nrow = length(unique(sce_myeloid$celltype)), ncol =14))
+rownames(myeloid_sig_M) <- unique(sce_myeloid$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Tissue.Type + info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+myeloid_logFC_M[,i] <- DA[rownames(myeloid_logFC_M), "logFC"]
+myeloid_sig_M[,i] <- DA[rownames(myeloid_logFC_M), "PValue"]
+  
+}
+
+myeloid_logFC_PT[is.na(myeloid_logFC_PT)] <- 0
+myeloid_sig_PT[is.na(myeloid_sig_PT)] <- 0
+
+```
+
+```{r Differential abundance for tumor cells}
+
+tumor <- sce_tumor[,which(sce_tumor$Tissue.Type %in% c("PT"))]
+tumor$metacluster <- metacluster[tumor$Patient.ID]
+tumor <- tumor[,which(tumor$metacluster != "NA")]
+  
+# Prepare abundance object
+abundances <- table(tumor$celltype, tumor$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(tumor)[match(colnames(abundances), tumor$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+tumor_logFC_PT <- as.data.frame(matrix(nrow = length(unique(sce_tumor$celltype)), ncol =14))
+rownames(tumor_logFC_PT) <- unique(sce_tumor$celltype)
+tumor_sig_PT <- as.data.frame(matrix(nrow = length(unique(sce_tumor$celltype)), ncol =14))
+rownames(tumor_sig_PT) <- unique(sce_tumor$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+tumor_logFC_PT[,i] <- DA[rownames(tumor_logFC_PT), "logFC"]
+tumor_sig_PT[,i] <- DA[rownames(tumor_logFC_PT), "PValue"]
+  
+}
+
+
+###METS
+
+tumor <- sce_tumor[,which(sce_tumor$Tissue.Type %in% c("SoftTissue", "Brain", "Bone", "Liver"))]
+tumor$metacluster <- metacluster[tumor$Patient.ID]
+tumor <- tumor[,which(tumor$metacluster != "NA")]
+  
+# Prepare abundance object
+abundances <- table(tumor$celltype, tumor$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(tumor)[match(colnames(abundances), tumor$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+tumor_logFC_M <- as.data.frame(matrix(nrow = length(unique(sce_tumor$celltype)), ncol =14))
+rownames(tumor_logFC_M) <- unique(sce_tumor$celltype)
+tumor_sig_M <- as.data.frame(matrix(nrow = length(unique(sce_tumor$celltype)), ncol =14))
+rownames(tumor_sig_M) <- unique(sce_tumor$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Tissue.Type + info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+tumor_logFC_M[,i] <- DA[rownames(tumor_logFC_M), "logFC"]
+tumor_sig_M[,i] <- DA[rownames(tumor_logFC_M), "PValue"]
+  
+}
+
+```
+
+
+```{r Differential abundance for T cells}
+
+Tcells <- sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("PT"))]
+Tcells$metacluster <- metacluster[Tcells$Patient.ID]
+Tcells <- Tcells[,which(Tcells$metacluster != "NA")]
+  
+# Prepare abundance object
+abundances <- table(Tcells$celltype, Tcells$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(Tcells)[match(colnames(abundances), Tcells$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+# For a specific tissue type
+Tcells_logFC_PT <- as.data.frame(matrix(nrow = length(unique(sce_Tcells$celltype)), ncol =14))
+rownames(Tcells_logFC_PT) <- unique(sce_Tcells$celltype)
+Tcells_sig_PT <- as.data.frame(matrix(nrow = length(unique(sce_Tcells$celltype)), ncol =14))
+rownames(Tcells_sig_PT) <- unique(sce_Tcells$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+Tcells_logFC_PT[,i] <- DA[rownames(Tcells_logFC_PT), "logFC"]
+Tcells_sig_PT[,i] <- DA[rownames(Tcells_logFC_PT), "PValue"]
+  
+}
+
+
+####METS
+
+Tcells <- sce_Tcells[,which(sce_Tcells$Tissue.Type %in% c("SoftTissue", "Liver", "Brain", "Bone"))]
+Tcells$metacluster <- metacluster[Tcells$Patient.ID]
+Tcells <- Tcells[,which(Tcells$metacluster != "NA")]
+  
+# Prepare abundance object
+abundances <- table(Tcells$celltype, Tcells$Patient.ID)
+abundances <- unclass(abundances)
+
+meta <- colData(Tcells)[match(colnames(abundances), Tcells$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+cur_ab <- abundances[,rownames(meta)]
+
+# For a specific tissue type
+Tcells_logFC_M <- as.data.frame(matrix(nrow = length(unique(sce_Tcells$celltype)), ncol =14))
+rownames(Tcells_logFC_M) <- unique(sce_Tcells$celltype)
+Tcells_sig_M <- as.data.frame(matrix(nrow = length(unique(sce_Tcells$celltype)), ncol =14))
+rownames(Tcells_sig_M) <- unique(sce_Tcells$celltype)
+
+for (i in 1:14) {
+  meta$info <- as.character(meta$metacluster)
+  meta$info[which(!(meta$info %in% as.character(i)))] <- "ref"
+  info <- factor(meta$info)
+  meta$info <- relevel(x=info, ref = "ref")
+y.ab <- DGEList(cur_ab, samples=meta, group = meta$info)
+
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Tissue.Type + info, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=colnames(fit.ab)[ncol(fit.ab)])
+summary(decideTests(res))
+DA <- res$table
+
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$PValue < 0.05, "yes", "no")
+
+# Sort by logFC
+order <- rev(rownames(DA))
+DA <- DA[order,]
+DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+Tcells_logFC_M[,i] <- DA[rownames(Tcells_logFC_M), "logFC"]
+Tcells_sig_M[,i] <- DA[rownames(Tcells_logFC_M), "PValue"]
+  
+}
+
+```
+
+
+
+```{r plotting}
+
+logFC_M <- rbind(tumor_logFC_M, Tcells_logFC_M, myeloid_logFC_M)
+logFC_M <- logFC_M[which(!(rownames(logFC_M) %in% c("Stroma", "Endothelial"))),]
+sig_M <- rbind(tumor_sig_M, Tcells_sig_M, myeloid_sig_M)
+sig_M <- sig_M[which(!(rownames(sig_M) %in% c("Stroma", "Endothelial"))),]
+
+# Correct for multiple comparison
+sig_M <- matrix(p.adjust(as.vector(as.matrix(sig_M)), method='BH'),ncol=14)
+
+#Tumor compartment
+input <- t(logFC_M[1:20,])
+sig_tumor <- t(sig_M[1:20,])
+
+Heatmap(input,
+        col = colorRamp2(c(-1,1), c("white", "white")),
+        cluster_columns = TRUE,
+        cluster_rows = FALSE,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+        if(sig_tumor[i,j] < 0.05 & input[i,j] > 0) {
+            grid.circle(x, y, w, h, r = unit(input[i,j]*0.3, "mm"),
+                        gp = gpar(fill = "deeppink4", col = NA, alpha = abs(input[i,j]*0.07)))
+        }
+          if(sig_tumor[i,j] < 0.05 & input[i,j] < 0) {
+            grid.circle(x, y, w, h, r = unit(input[i,j]*0.3, "mm"),
+                        gp = gpar(fill = "#000066", col = NA, alpha = abs(input[i,j]*0.07)))
+        }
+    })
+
+
+#Myeloid compartment
+input_immune <- t(logFC_M[-c(1:20),])
+sig_immune <- t(sig_M[-c(1:20),])
+
+Heatmap(input_immune,
+        col = colorRamp2(c(-1,1), c("white", "white")),
+        cluster_columns = TRUE,
+        cluster_rows = FALSE,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+        if(sig_immune[i,j] < 0.05 & input_immune[i,j] > 0) {
+            grid.circle(x, y, w, h, r = unit(input_immune[i,j]*0.6, "mm"),
+                        gp = gpar(fill = "deeppink4", col = NA, alpha = abs(input_immune[i,j]*0.2)))
+        }
+          if(sig_immune[i,j] < 0.05 & input_immune[i,j] < 0) {
+            grid.circle(x, y, w, h, r = unit(input_immune[i,j]*0.6, "mm"),
+                        gp = gpar(fill = "#000066", col = NA, alpha = abs(input_immune[i,j]*0.2)))
+        }
+    })
+
+```
+

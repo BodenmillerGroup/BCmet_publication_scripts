@@ -1,0 +1,656 @@
+---
+title: "ImmuneCombined_01"
+author: "SandraTietscher"
+date: "2021-12-11"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(dittoSeq)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(cowplot)
+library(CATALYST)
+library(viridis)
+library(ggpubr)
+library(vegan)
+library(pairwiseAdonis)
+library(edgeR)
+
+# Read immune sce
+sce_immune <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_immune$patient.tissue <- paste(sce_immune$Patient.ID, sce_immune$Tissue.Type, sep = "_")
+sce_immune$patient.tissue.loc <- paste(sce_immune$patient.tissue, sce_immune$Location, sep = "_")
+
+# Read macrophage sce
+sce_M <- readRDS("output/SCEs/myeloid/myeloidSCE_M.rds")
+sce_M$patient.tissue <- paste(sce_M$Patient.ID, sce_M$Tissue.Type, sep = "_")
+sce_M$patient.tissue.loc <- paste(sce_M$patient.tissue, sce_M$Location, sep = "_")
+
+# Read in ROI metadata
+ROI_meta <- read.csv("data/immune_images_patient_metadata_encoded.csv")
+
+ROI_meta <- ROI_meta[ROI_meta$Location != "na",]
+ROI_meta$patient.tissue <- paste(ROI_meta$Patient.ID, ROI_meta$Tissue.Type, sep = "_")
+sample_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue),]
+rownames(sample_unique) <- sample_unique$patient.tissue
+# 
+# ROI_meta$patient.tissue.loc <- paste(ROI_meta$patient.tissue, ROI_meta$Location, sep = "_")
+# ROI_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue.loc),]
+# rownames(ROI_unique) <- ROI_unique$patient.tissue.loc
+
+# Use only intratumoral regions
+sce_immune <- sce_immune[,which(sce_immune$Location %in% c("intratumoral"))]
+sce_M <- sce_M[,which(sce_M$Location %in% c("intratumoral"))]
+
+```
+
+# Merge T cell subtype proportions and myeloid subtype proportions into one table
+
+Samples are defined as Patient-Tissuetype combinations
+
+Not taking into account the absolute T cell and myeloid frequency, i.e. all T cell subtype proportions add up to 1, and all myeloid subtype proportions add up to 1.
+
+
+```{r merge-TM}
+sce_T <- sce_immune[,which(sce_immune$Tcell_subtype != "none")]
+
+T_prop <- prop.table(table(sce_T$patient.tissue, sce_T$Tcell_subtype), margin = 1)
+M_prop <- prop.table(table(sce_M$patient.tissue, sce_M$M_cluster), margin = 1)
+
+# Make sure rownames are in the same order
+rownames_M <- rownames(M_prop)
+rownames_T <- rownames(T_prop)
+rownames_both <- intersect(rownames_M, rownames_T)
+T_prop <- T_prop[rownames_both,]
+M_prop <- M_prop[rownames_both,]
+all.equal(rownames(M_prop), rownames(T_prop))
+
+TM_prop <- cbind(T_prop, M_prop)
+```
+
+## Add general immune composition
+
+HLA-DR high cell cluster is excluded because we cannot know whether it contains myeloid cells or not.
+
+```{r merge-TM-im}
+sce_im <- sce_immune[,which(sce_immune$cell_class == "immune" & sce_immune$celltype != "HLA-DR_high")]
+im_prop <- prop.table(table(sce_im$patient.tissue, sce_im$celltype), margin = 1)
+im_prop <- im_prop[rownames(M_prop),]
+im_prop[,"myeloid"] <- rowSums(im_prop[,c("myeloid", "neutrophil")])
+im_prop <- im_prop[,!(colnames(im_prop) %in% c("HLA-DR_high", "neutrophil"))]
+TMim_prop <- cbind(TM_prop, im_prop)
+```
+
+# Define colors for cell subtypes
+
+```{r define-colors, message=FALSE, results="hide"}
+T_col <- c("#666600", "#93D50F", "#CCCC00", "#00CC00", "#00FF00", "#003319", "#0FD5B4", "#66FFFF", "#00CCCC", "#3333FF", "#99CCFF")
+names(T_col) <- colnames(T_prop)
+
+M_col <- c("#CC99FF", "#7F00FF", "#CC00CC", "#FF66FF", "#CC0066", "#9A6767", "#990000", 
+           "#B30303", "#F03C3C", "#FF9999", "#FFB266", "#FF8000", "#CC6600", "#E6A73A",
+           "#FFAE33", "#D2BD50", "#F6E176", "#F9D20E", "#FFEA33", "#D7FF33")
+names(M_col) <- colnames(M_prop)
+
+molSubtype_col <- c("#FC4E07","#E7B800","#00AFBB","gray")
+names(molSubtype_col) <- unique(sample_unique$molecular.subtype)
+```
+
+## Absolute immune composition
+I.e. correcting T cell subtype proportions for total T cell proportion, and same for myeloid cells
+
+```{r absolute-proportions}
+TMim_prop_abs <- TMim_prop
+
+# Multiply T cell subtype proportions by total T cell proportion for each sample
+for (i in colnames(T_prop)) {
+  TMim_prop_abs[,i] <- TMim_prop_abs[,i] * TMim_prop_abs[,"T_cell"]
+}
+
+# Multiply myeloid cell subtype proportions by total myeloid cell proportion for each sample
+for (i in colnames(M_prop)) {
+  TMim_prop_abs[,i] <- TMim_prop_abs[,i] * TMim_prop_abs[,"myeloid"]
+}
+
+TMim_prop_abs <- TMim_prop_abs[,!(colnames(TMim_prop_abs) %in% c("myeloid", "T_cell"))]
+
+# Check if rowSums equal 1
+rowSums(TMim_prop_abs)
+```
+
+# Large full-TIME overview: Hierachical barplots
+
+```{r TIME-proportion-barplots, fig.width= 25, fig.height=20}
+library(ComplexHeatmap)
+library(scales)
+
+cprops <- as.matrix(as.data.frame.matrix(TMim_prop_abs))
+
+ha.T <- rowAnnotation(T_subtype = anno_barplot(TMim_prop_abs[,colnames(T_prop)],  gp = gpar(fill = T_col, col = NA), width = unit(10, "cm"), bar_width = 0.9, ylim = c(0,1)))
+ha.M <- rowAnnotation(myeloid_subtype = anno_barplot(TMim_prop_abs[,colnames(M_prop)],  gp = gpar(fill = M_col, col = NA), width = unit(10, "cm"), bar_width = 0.9, ylim = c(0,1)))
+ha.im <- rowAnnotation(immune_composition = anno_barplot(im_prop[,!(colnames(im_prop) %in% c("T_cell", "myeloid"))],  gp = gpar(fill = hue_pal()(3), col = NA), width = unit(10, "cm"), bar_width = 0.9, ylim = c(0,1)))
+ha2 <-   rowAnnotation(tissuetype = sample_unique[rownames(cprops),]$Tissue.Type, molecular_subtype = sample_unique[rownames(cprops),]$molecular.subtype, col = list(tissuetype = sce_immune@metadata$colour_vectors$tissuetype, molecular_subtype = molSubtype_col))
+
+ha_legend <- list(
+  Legend(labels= names(T_col), legend_gp = gpar(fill = T_col)), 
+  Legend(labels= names(M_col), legend_gp = gpar(fill = M_col)),
+  Legend(labels= c("B_cell", "NK_cell", "plasma_cell"), legend_gp = gpar(fill = hue_pal()(3))))
+
+heatmap <- Heatmap(cprops) + ha.im + ha.T +ha.M +ha2
+draw(heatmap, annotation_legend_list=ha_legend)
+```
+
+
+# PCA
+
+Perform the PCA on centered log-ratios (clr), akin to the approach that CATALYST uses. CLR cannot handle 0 in the data, so a pseudocount has to be added to the original abundances.
+Good guide: http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/112-pca-principal-component-analysis-essentials/
+
+Start with abundances instead of proportions.
+
+```{r merge-TM-pseudocount}
+#For each patient/tissue combination: Merge abundances of myeloid cell clusters with abundances of T cell subtypes and other immune cell types
+ab_M <- as.data.frame.matrix(table(sce_M$patient.tissue, sce_M$M_cluster))
+ab_T <- as.data.frame.matrix(table(sce_T$patient.tissue, sce_T$Tcell_subtype))
+ab_im <- as.data.frame.matrix(table(sce_immune$patient.tissue, sce_immune$celltype)[,c("B_cell", "NK_cell", "plasma_cell")])
+ab <- merge(ab_M, ab_T, by = 0)
+ab <- data.frame(ab[,-1], row.names=ab[,1])
+ab <- merge(ab, ab_im, by = 0)
+
+# Calculate centered log-transform of abundances
+ab <- data.frame(ab[,-1], row.names = ab[,1])
+fqs  <- log(prop.table(as.matrix(ab) + 1, 1), 2)
+TMim_clr  <- as.data.frame.matrix(fqs-rowMeans(fqs))
+
+```
+
+```{r factominer-PCA}
+library(FactoMineR)
+library(compositions)
+library(factoextra)
+
+TMim_clr$sample <- rownames(TMim_clr)
+TMim_clr <- separate(TMim_clr, "sample", into = c("Patient", "Tissue.Type"), sep = "_")
+resTM <- PCA(TMim_clr[,-35], scale.unit = FALSE, quali.sup = 35)
+plot.PCA(resTM, axes=c(1, 2), choix="ind", habillage=35, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype)
+plot.PCA(resTM, axes=c(1, 3), choix="ind", habillage=35, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype)
+fviz_pca_var(resTM, axes = c(1,2), col.var="contrib", gradient.cols = c("grey","#990000", "#990000"), repel = TRUE)
+fviz_pca_var(resTM, axes = c(1,3), col.var="contrib", gradient.cols = c("grey","#990000", "#990000"), repel = TRUE)
+```
+
+# UMAP
+
+Based on clr-transformed TIME composition.
+
+```{r prop-umap}
+library(umap)
+
+ # run umap on the centered log-ratios
+TMim_umap <- umap(TMim_clr[,-(35:36)])
+
+# prepare for plotting with ggplot2
+umap_plot_df <- data.frame(TMim_umap$layout) %>%
+   # Turn sample IDs stored as row names into a column
+   tibble::rownames_to_column("patient.tissue")
+umap_plot_df <- separate(umap_plot_df, "patient.tissue", into = c("Patient", "Tissue.Type"), sep = "_")
+
+ # Plot with ggplot
+ ggplot(umap_plot_df, aes(x = X1, y = X2, color = Tissue.Type)) +
+   geom_point(size = 2)+
+   scale_color_manual(values = sce_im@metadata$colour_vectors$tissuetype)+
+   xlab("UMAP1") + ylab("UMAP2")+
+   theme(panel.background = element_blank(), panel.border = element_rect(color = "black", fill = NA, size = 1))
+```
+
+# Permanova of different metastatic sites (without PT)
+
+### General immune composition
+
+```{r permanova-mets-immune}
+ab_im <- table(sce_im$patient.tissue, sce_im$celltype)
+ab_im[,"myeloid"] <- rowSums(ab_im[,c("myeloid", "neutrophil")])
+ab_im <- ab_im[,!(colnames(ab_im) %in% c("HLA-DR_high", "neutrophil"))]
+
+# Calculate centered log-transform of abundances
+im_fqs  <- log(prop.table(as.matrix(ab_im) + 1, 1), 2)
+im_clr  <- as.data.frame.matrix(im_fqs-rowMeans(im_fqs))
+
+# Subset metastatic samples
+im_clr$sample <- rownames(im_clr)
+im_clr <- separate(im_clr, "sample", into = c("Patient", "Tissue.Type"), sep = "_")
+im_clr_met <- filter(im_clr, Tissue.Type != "PT")
+
+# Remove samples from patients with multiple metastatic sites (they are not independent data points)
+is.multiple <- sample_unique[sample_unique$Site.of.metastasis == "Multiple","Patient.ID"]
+im_clr_met <- filter(im_clr_met, !(im_clr_met$Patient %in% is.multiple))
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+dist <- vegdist(im_clr_met[,-(6:7)], method = "euclidean")
+
+metadata <- data.frame(tissuetype = im_clr_met$Tissue.Type, molecular.subtype = sce_im$molecular.subtype[match(rownames(im_clr_met), sce_im$patient.tissue)])
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$tissuetype, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 99)
+
+mode_subtype <- betadisper(dist, metadata$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+
+# Run permanova
+adonis(dist ~molecular.subtype*tissuetype,  data=metadata, permutations=9999)
+
+# Check for pairwise significance
+pairwise.adonis(dist,metadata$tissuetype,p.adjust.m= 'BH')
+pairwise.adonis(dist,metadata$molecular.subtype,p.adjust.m= 'BH')
+
+
+#PCA
+im_clr_met$molecular.subtype <- metadata$molecular.subtype
+resim <- PCA(im_clr_met[,-(6)], scale.unit = FALSE, quali.sup = 6:7)
+plot.PCA(resim, axes=c(1, 2), choix="ind", habillage=6, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype[c(1,3,4,5)])
+plot.PCA(resim, axes=c(1, 2), choix="ind", habillage=7, label = "quali", palette = molSubtype_col)
+plot.PCA(resim, axes=c(1, 2), choix="var", habillage="contrib")
+
+```
+
+### T cell subtypes only
+
+```{r permanova-mets-Tcells}
+# Calculate centered log-transform of abundances
+T_fqs  <- log(prop.table(as.matrix(ab_T) + 1, 1), 2)
+T_clr  <- as.data.frame.matrix(T_fqs-rowMeans(T_fqs))
+
+# Subset metastatic samples
+T_clr$sample <- rownames(T_clr)
+T_clr <- separate(T_clr, "sample", into = c("Patient", "Tissue.Type"), sep = "_")
+T_clr_met <- filter(T_clr, Tissue.Type != "PT")
+
+# Remove samples from patients with multiple metastatic sites (they are not independent data points)
+is.multiple <- sample_unique[sample_unique$Site.of.metastasis == "Multiple","Patient.ID"]
+T_clr_met <- filter(T_clr_met, !(T_clr_met$Patient %in% is.multiple))
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+dist <- vegdist(T_clr_met[,-(12:13)], method = "euclidean")
+
+metadata <- data.frame(tissuetype = T_clr_met$Tissue.Type, molecular.subtype = sce_T$molecular.subtype[match(rownames(T_clr_met), sce_T$patient.tissue)])
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$tissuetype, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 999)
+
+mode_subtype <- betadisper(dist, metadata$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+
+# Run permanova
+adonis(dist ~molecular.subtype*tissuetype,  data=metadata, permutations=9999)
+
+# Check for pairwise significance
+pairwise.adonis(dist,metadata$tissuetype,p.adjust.m= 'BH')
+pairwise.adonis(dist,metadata$molecular.subtype,p.adjust.m= 'BH')
+
+#PCA
+T_clr_met$molecular.subtype <- metadata$molecular.subtype
+resT <- PCA(T_clr_met[,-12], scale.unit = FALSE, quali.sup = 12:13)
+plot.PCA(resT, axes=c(1, 2), choix="ind", habillage=12, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype[c(1,3,4,5)])
+plot.PCA(resT, axes=c(1, 2), choix="ind", habillage=13, label = "quali", palette = molSubtype_col)
+plot.PCA(resT, axes=c(1, 2), choix="var", col.var = T_col)
+
+```
+
+### Myeloid cell subtypes only
+
+```{r permanova-mets-myeloid}
+# Calculate centered log-transform of abundances
+M_fqs  <- log(prop.table(as.matrix(ab_M) + 1, 1), 2)
+M_clr  <- as.data.frame.matrix(M_fqs-rowMeans(M_fqs))
+
+# Subset metastatic samples
+M_clr$sample <- rownames(M_clr)
+M_clr <- separate(M_clr, "sample", into = c("Patient", "Tissue.Type"), sep = "_")
+M_clr_met <- filter(M_clr, Tissue.Type != "PT")
+
+# Remove samples from patients with multiple metastatic sites (they are not independent data points)
+is.multiple <- sample_unique[sample_unique$Site.of.metastasis == "Multiple","Patient.ID"]
+M_clr_met <- filter(M_clr_met, !(M_clr_met$Patient %in% is.multiple))
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+dist <- vegdist(M_clr_met[,-(21:22)], method = "euclidean")
+
+metadata <- data.frame(tissuetype = M_clr_met$Tissue.Type, molecular.subtype = sce_M$molecular.subtype[match(rownames(M_clr_met), sce_M$patient.tissue)])
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$tissuetype, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 999)
+
+mode_subtype <- betadisper(dist, metadata$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+
+# Run permanova
+adonis(dist ~molecular.subtype*tissuetype,  data=metadata, permutations=9999)
+
+# Check for pairwise significance
+pairwise.adonis(dist,metadata$tissuetype,p.adjust.m= 'BH')
+pairwise.adonis(dist,metadata$molecular.subtype,p.adjust.m= 'BH')
+
+#PCA
+M_clr_met$molecular.subtype <- metadata$molecular.subtype
+resM <- PCA(M_clr_met[,-21], scale.unit = FALSE, quali.sup = 21:22)
+plot.PCA(resM, axes=c(1, 2), choix="ind", habillage=21, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype[c(1,3,4,5)])
+plot.PCA(resM, axes=c(1, 2), choix="ind", habillage=22, label = "quali", palette = molSubtype_col)
+plot.PCA(resM, axes=c(1, 2), choix="var", col.var = M_col)
+
+# Visualize PCA using ggplot
+M_clr_met$pc1 <- resM$ind$coord[, 1]
+M_clr_met$pc2 <- resM$ind$coord[, 2]
+
+ggplot(data = M_clr_met, aes(x = pc1, y = pc2)) +
+  geom_point(alpha = 0.8, aes(color = Tissue.Type, shape = molecular.subtype))+
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2)
+  
+```
+
+### Full TIME  
+
+```{r permanova-mets-TIME}
+# Subset metastatic samples
+TMim_clr_met <- filter(TMim_clr, Tissue.Type != "PT")
+
+# Remove samples from patients with multiple metastatic sites (they are not independent data points)
+TMim_clr_met <- filter(TMim_clr_met, !(TMim_clr_met$Patient %in% is.multiple))
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+dist <- vegdist(TMim_clr_met[,-(35:36)], method = "euclidean")
+
+metadata <- data.frame(tissuetype = TMim_clr_met$Tissue.Type, molecular.subtype = sce_im$molecular.subtype[match(rownames(TMim_clr_met), sce_im$patient.tissue)])
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$tissuetype, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 999)
+
+mode_subtype <- betadisper(dist, metadata$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+
+# Run permanova
+adonis(dist ~molecular.subtype*tissuetype,  data=metadata, permutations=9999)
+
+# Check for pairwise significance
+pairwise.adonis(dist,metadata$tissuetype,p.adjust.m= 'BH')
+pairwise.adonis(dist,metadata$molecular.subtype,p.adjust.m= 'BH')
+
+#PCA
+TMim_clr_met$molecular.subtype <- metadata$molecular.subtype
+resTMim <- PCA(TMim_clr_met[,-35], scale.unit = FALSE, quali.sup = 35:36)
+plot.PCA(resTMim, axes=c(1, 2), choix="ind", habillage=35, label = "quali", palette = sce_im@metadata$colour_vectors$tissuetype[c(1,3,4,5)])
+plot.PCA(resTMim, axes=c(1, 2), choix="ind", habillage=36, label = "quali", palette = molSubtype_col)
+plot.PCA(resTMim, axes=c(1, 2), choix="var", habillage="contrib")
+
+
+```
+
+# Permanova: Test if immune cells of the PT are more similar based on molecular subtype and site of metastasis
+
+```{r permanova-PT-site-of-metastasis}
+
+TMim_clr_PT <- filter(TMim_clr, Tissue.Type == "PT")
+
+metadata <- data.frame(patient.tissue = rownames(TMim_clr_PT),
+                       molecular.subtype = sce_T$molecular.subtype[match(rownames(TMim_clr_PT), sce_T$patient.tissue)],
+                       site.of.metastasis = sce_T$Site.of.metastasis[match(rownames(TMim_clr_PT), sce_T$patient.tissue)])
+
+dist <- vegdist(TMim_clr_PT[,-(35:36)],method = 'euclidean', na.rm = TRUE)
+
+### check if dispersions are significantly different in the groups
+mod_tissue <- betadisper(dist, metadata$site.of.metastasis, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_tissue, pairwise = TRUE, permutations = 999)
+
+mode_subtype <- betadisper(dist, metadata$molecular.subtype, type = "median", bias.adjust = TRUE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mode_subtype, pairwise = TRUE, permutations = 999)
+
+# Run permanova
+adonis(dist ~molecular.subtype*site.of.metastasis,  data=metadata, permutations=9999)
+
+# Check for pairwise significance
+pairwise.adonis(dist,metadata$site.of.metastasis,p.adjust.m= 'BH')
+pairwise.adonis(dist,metadata$molecular.subtype,p.adjust.m= 'BH')
+
+# Plot PCA
+TMim_clr_PT <- as.data.frame.matrix(TMim_clr_PT)
+TMim_clr_PT$molecular.subtype <- metadata$molecular.subtype
+TMim_clr_PT$site.of.metastasis <- metadata$site.of.metastasis
+
+siteOfMet_col <- sce_im@metadata$colour_vectors$tissuetype
+names(siteOfMet_col)[2] <- "Multiple"
+
+immune_col <- c(T_col, M_col, "#F3766E", "#2AB34B", "#7094CD")
+names(immune_col)[32:34] <- c("B_cell", "NK_cell", "plasma_cell")
+
+res <- PCA(TMim_clr_PT[,-(35:36)], scale.unit = FALSE, quali.sup = 35:36)
+plot.PCA(res, axes=c(1, 2), choix="ind", habillage=35, label = "quali", palette = molSubtype_col)
+plot.PCA(res, axes=c(1, 2), choix="ind", habillage=36, label = "quali", palette = siteOfMet_col)
+plot.PCA(res, axes=c(1, 2), choix="var", col.var = immune_col)
+
+fviz_pca_var(res, axes = c(1,2), col.var = immune_col, repel = TRUE)
+
+```
+
+### Follow up to Permanova: DA of TIME for PTs that metastasize to Brain vs Soft Tissue and Bone vs Soft Tissue
+
+Does not run due to a problem with edgeR
+
+```{r DA-PT-siteOfMetastasis}
+# ab$sample <- rownames(ab)
+# ab <- separate(ab, "sample", into = c("Patient", "Tissue.Type"), sep = "_")
+# ab_sub <- filter(ab, Tissue.Type == "PT")
+# ab_sub$Site.of.metastasis <- sample_unique$Site.of.metastasis[match(ab_sub$Patient, sample_unique$Patient.ID)]
+# ab_sub$molecular.subtype <- sample_unique$molecular.subtype[match(ab_sub$Patient, sample_unique$Patient.ID)]
+# ab_sub <- filter(ab_sub, Site.of.metastasis %in% c("Bone", "Brain", "SoftTissue"))
+# 
+# abundances <- t(ab_sub[,-(35:38)])
+# 
+# # Attach column metadata and relevel so that "margin" is the baseline group
+# meta <- ab_sub[,35:38]
+# site.of.met <- factor(meta$Site.of.metastasis)
+# meta$site.of.met <- relevel(x=site.of.met, ref = "SoftTissue")
+# y.ab <- DGEList(abundances, samples=meta, group = meta$site.of.met)
+# design <- model.matrix(~molecular.subtype + site.of.met, data = y.ab$samples)
+# 
+# # Estimate NB and QL dispersion
+# y.ab <- estimateDisp(y.ab, design, trend="none")
+# summary(y.ab$common.dispersion)
+# fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+# summary(fit.ab$var.prior)
+# 
+# # Plot
+# 
+# ## Brain vs SoftTissue
+#   res <- glmQLFTest(fit.ab, coef="site.of.metBrain")
+#   summary(decideTests(res))
+#   DA <- topTags(res, n = 20)$table
+#   DA$celltype <- rownames(DA)
+#   DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+#   
+#   # Sort by logFC
+#   order <- rownames(DA[order(DA$logFC),])
+#   DA <- DA[order,]
+#   DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+# 
+# ggplot(DA, aes(celltype, y = logFC))+
+#   geom_col(aes(fill=sign))+
+#   scale_fill_manual(values = c("grey", "darkgreen"))+
+#   labs(y=paste0("logFC: Brain vs Soft Tissue"), x="Cell type")+
+#   coord_flip()+
+#   labs(fill="Significant (FDR<0.05)")+
+#   theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+# 
+# ## Intratumoral vs margin
+# res <- glmQLFTest(fit.ab, coef="site.of.metBone")
+#   summary(decideTests(res))
+#   DA <- topTags(res, n = 20)$table
+#   DA$celltype <- rownames(DA)
+#   DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+#   
+#   # Sort same as above
+#   DA <- DA[order,]
+#   DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+# 
+# ggplot(DA, aes(celltype, y = logFC))+
+#   geom_col(aes(fill=sign))+
+#   scale_fill_manual(values = c("grey", "darkgreen"))+
+#   labs(y=paste0("logFC: Bone vs Soft Tissue"), x="Cell type")+
+#   coord_flip()+
+#   labs(fill="Significant (FDR<0.05)")+
+#   theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+
+T cell composition (includes only intratumoral regions)
+
+```{r DA-PT-siteOfMetastasis-Tcells}
+sce_T_sub <- filterSCE(sce_T, Site.of.metastasis %in% c("Brain", "Bone", "SoftTissue"), Tissue.Type == "PT")
+
+abundances <- table(sce_T_sub$Tcell_subtype, sce_T_sub$Patient.ID) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "margin" is the baseline group
+meta <- colData(sce_T_sub)[match(colnames(abundances), sce_T_sub$Patient.ID),]
+site.of.met <- factor(meta$Site.of.metastasis)
+meta$site.of.met <- relevel(x=site.of.met, ref = "SoftTissue")
+y.ab <- DGEList(abundances, samples=meta, group = meta$site.of.met)
+design <- model.matrix(~molecular.subtype + site.of.met, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Plot
+
+## Brain vs SoftTissue
+  res <- glmQLFTest(fit.ab, coef="site.of.metBrain")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 20)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort by logFC
+  order <- rownames(DA[order(DA$logFC),])
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Brain vs Soft Tissue"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+## Intratumoral vs margin
+res <- glmQLFTest(fit.ab, coef="site.of.metBone")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 20)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Bone vs Soft Tissue"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+Myeloid cell composition (includes only intratumoral regions)
+
+Does not run due to a problem with edgeR
+
+```{r DA-PT-siteOfMetastasis-M}
+# sce_M_sub <- filterSCE(sce_M, Site.of.metastasis %in% c("Brain", "Bone", "SoftTissue"), Tissue.Type == "PT")
+# 
+# abundances <- table(sce_M_sub$M_cluster, sce_M_sub$patient.tissue.loc) 
+# abundances <- unclass(abundances) 
+# 
+# # Attach column metadata and relevel so that "margin" is the baseline group
+# meta <- colData(sce_M_sub)[match(colnames(abundances), sce_M_sub$patient.tissue.loc),]
+# site.of.met <- factor(meta$Site.of.metastasis)
+# meta$site.of.met <- relevel(x=site.of.met, ref = "SoftTissue")
+# y.ab <- DGEList(abundances, samples=meta, group = meta$site.of.met)
+# design <- model.matrix(~molecular.subtype + site.of.met, data = y.ab$samples)
+# 
+# # Estimate NB and QL dispersion
+# y.ab <- estimateDisp(y.ab, design, trend="none")
+# summary(y.ab$common.dispersion)
+# fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+# summary(fit.ab$var.prior)
+# 
+# # Plot
+# 
+# ## Brain vs SoftTissue
+#   res <- glmQLFTest(fit.ab, coef="site.of.metBrain")
+#   summary(decideTests(res))
+#   DA <- topTags(res, n = 20)$table
+#   DA$celltype <- rownames(DA)
+#   DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+#   
+#   # Sort by logFC
+#   order <- rownames(DA[order(DA$logFC),])
+#   DA <- DA[order,]
+#   DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+# 
+# ggplot(DA, aes(celltype, y = logFC))+
+#   geom_col(aes(fill=sign))+
+#   scale_fill_manual(values = c("grey", "darkgreen"))+
+#   labs(y=paste0("logFC: Brain vs Soft Tissue"), x="Cell type")+
+#   coord_flip()+
+#   labs(fill="Significant (FDR<0.05)")+
+#   theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+# 
+# ## Intratumoral vs margin
+# res <- glmQLFTest(fit.ab, coef="site.of.metBone")
+#   summary(decideTests(res))
+#   DA <- topTags(res, n = 20)$table
+#   DA$celltype <- rownames(DA)
+#   DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+#   
+#   # Sort same as above
+#   DA <- DA[order,]
+#   DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+# 
+# ggplot(DA, aes(celltype, y = logFC))+
+#   geom_col(aes(fill=sign))+
+#   scale_fill_manual(values = c("grey", "darkgreen"))+
+#   labs(y=paste0("logFC: Bone vs Soft Tissue"), x="Cell type")+
+#   coord_flip()+
+#   labs(fill="Significant (FDR<0.05)")+
+#   theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+
+
+

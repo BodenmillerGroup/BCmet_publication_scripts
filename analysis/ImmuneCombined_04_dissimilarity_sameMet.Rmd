@@ -1,0 +1,407 @@
+---
+title: "ImmuneCombined_04_dissimilarity_sameMet"
+author: "SandraTietscher"
+date: "2022-01-03"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+This script calculates dissimilarity scores for randomly paired metastatic samples from the same metastatic site, and compares them to dissimilarity scores for matched PT & met samples.
+
+Not entirely sure if this approach is valid, because metastatic samples have generally far fewer cells, and because there is only a small number of possible Met&Met pairs to permute over.
+
+# Load libraries and data
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(vegan)
+library(ComplexHeatmap)
+
+
+# Read immune sce
+sce_immune <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+sce_immune$patient.tissue <- paste(sce_immune$Patient.ID, sce_immune$Tissue.Type, sep = "_")
+sce_immune$MetPT <- ifelse(sce_immune$Tissue.Type == "PT", "PT", "Met")
+sce_immune$patient.MetPT <- paste(sce_immune$Patient.ID, sce_immune$MetPT, sep = "_")
+
+# Read macrophage sce
+sce_M <- readRDS("output/SCEs/myeloid/myeloidSCE_M.rds")
+sce_M$patient.tissue <- paste(sce_M$Patient.ID, sce_M$Tissue.Type, sep = "_")
+sce_M$MetPT <- ifelse(sce_M$Tissue.Type == "PT", "PT", "Met")
+sce_M$patient.MetPT <- paste(sce_M$Patient.ID, sce_M$MetPT, sep = "_")
+
+# Read in ROI metadata for immune panel
+ROI_meta <- read.csv("data/immune_images_patient_metadata_encoded.csv")
+ROI_meta$patient.tissue <- paste(ROI_meta$Patient.ID, ROI_meta$Tissue.Type, sep = "_")
+sample_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue),]
+rownames(sample_unique) <- sample_unique$patient.tissue
+
+
+# Read in ROI metadata for myeloid panel
+ROI_meta_M <- read.csv("data/macrophage_images_patient_metadata_encoded.csv")
+
+ROI_meta_M$patient.tissue <- paste(ROI_meta_M$Patient.ID, ROI_meta_M$Tissue.Type, sep = "_")
+sample_unique_M <- ROI_meta_M[!duplicated(ROI_meta_M$patient.tissue),]
+rownames(sample_unique_M) <- sample_unique_M$patient.tissue
+
+```
+
+# Subset: Use only intratumoral samples
+
+```{r subset-intratumoral}
+sce_immune_intra <- filterSCE(sce_immune, Location == "intratumoral")
+sce_M_intra <- filterSCE(sce_M, Location == "intratumoral")
+```
+
+# Subset: Exclude samples with multiple metastatic sites
+
+```{r exclude-multiple}
+sce_immune_intra <- filterSCE(sce_immune_intra, Site.of.metastasis != "Multiple")
+sce_M_intra <- filterSCE(sce_M_intra, Site.of.metastasis != "Multiple")
+```
+
+# General immune cell abundances
+
+### Calculate Aitchison distance between matched samples
+
+For PTs with multiple matched metastatic sites, these sites are pooled before calculating the Aitchison distance between sample pairs.
+
+```{r immune-aitchison}
+sce_im <- filterSCE(sce_immune_intra, celltype %in% c("NK_cell", "T_cell", "myeloid", "plasma_cell", "B_cell", "neutrophil"))
+sce_met <- filterSCE(sce_im,Tissue.Type!="PT")
+sce_PT <- filterSCE(sce_im,Tissue.Type=="PT")
+
+# Calculate centered log-transform of abundances
+ncs_met <- table(sce_met$patient.MetPT, sce_met$celltype)
+fqs_met  <- log(prop.table(ncs_met + 1, 1), 2)
+clr_met  <- as.data.frame.matrix(fqs_met-rowMeans(fqs_met))
+
+ncs_PT <- table(sce_PT$patient.MetPT, sce_PT$celltype)
+fqs_PT <- log(prop.table(ncs_PT+ 1, 1), 2)
+clr_PT <- as.data.frame.matrix(fqs_PT-rowMeans(fqs_PT))
+
+clr_met$patient.MetPT <- rownames(clr_met)
+clr_met <- separate(clr_met, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+clr_PT$patient.MetPT <- rownames(clr_PT)
+clr_PT <- separate(clr_PT, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+
+# Create empty dissimilarity data frame
+diss.obs <- as.data.frame(matrix(ncol = 2, nrow = length(rownames(clr_met)), dimnames = list(rownames(clr_met), c("patient.MetPT", "diss_to_PT"))))
+
+# Loop over metastatic tissues and compute dissimilarity to matched PT
+for(i in rownames(clr_met)){
+ patientID <- clr_met[i,"patient"]
+ abundances <- rbind(clr_met[i,], filter(clr_PT, patient == patientID))
+ if(nrow(abundances) == 2) {
+   diss <- vegdist(abundances[,1:6],method = 'euclidean', binary = FALSE,na.rm = TRUE)
+    diss.obs[i,] <- c(i, diss)
+ }
+}
+
+# Remove NAs (samples for which no PT data is available)
+diss.obs <- na.exclude(diss.obs)
+diss.obs <- separate(diss.obs, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+diss.obs$site.of.metastasis <- sample_unique$Site.of.metastasis[match(diss.obs$patient, sample_unique$Patient.ID)]
+diss.obs$diss_to_PT <- as.numeric(diss.obs$diss_to_PT)
+```
+
+### Random matching of Mets to other Mets of the same site
+
+```{r immune-permutations}
+
+# Create empty data frame for 1000 permutations
+diss.perm <- as.data.frame(matrix(ncol = 1000, nrow = length(rownames(diss.obs)), dimnames = list(rownames(diss.obs), c(1:1000))))
+
+
+# Loop for permutations
+for (zz in 1:1000) {
+  
+  # Loop over metastatic tissues and compute dissimilarity to random other metastatis from the same site
+  for(i in 1:length(rownames(diss.obs))){
+    sample <- rownames(diss.obs)[i]
+    site <- diss.obs[i, "site.of.metastasis"]
+    same.site <- filter(diss.obs[-i,], site.of.metastasis == site) ## remove the sample in question
+    random.sample <- sample(rownames(same.site))[1]
+    abundances <- rbind(clr_met[sample,1:6], clr_met[random.sample, 1:6])
+    
+    # Add to large permutation matrix
+    diss.perm[sample,zz] <- vegdist(abundances, method = 'euclidean', binary = FALSE,na.rm = TRUE)
+  }
+} 
+
+
+# Plot distribution of observed and distribution of permuted dissimilarity scores
+diss.perm.long <- reshape2::melt(diss.perm)
+diss.perm.long$type <- "permuted"
+diss.obs.long <- as.data.frame(diss.obs$diss_to_PT)
+colnames(diss.obs.long) <- "value"
+diss.obs.long$type <- "observed"
+diss.merged <- rbind(diss.perm.long[,2:3], diss.obs.long)
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_histogram(aes(y=..density..), position="identity", alpha=0.3)+scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+ks.test(diss.obs.long$value, diss.perm.long$value, alternative = "greater")
+
+# Plot distribution of permuted means
+obs.median <- median(diss.obs.long$value)
+perm.medians <- apply(diss.perm, MARGIN = 2, FUN = median)
+
+# Test for normal distribution of permuted medians
+shapiro.test(perm.medians)
+
+# Test probability of the observed median to be drawn from the distribution of permuted medians
+sig <- pnorm(obs.median, mean = mean(perm.medians), sd = sd(perm.medians))
+
+ggplot(as.data.frame(perm.medians),aes(x=perm.medians,..scaled..)) + 
+  geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=median(diss.obs.long$value), linetype="dashed")+theme(legend.position="top") +
+  annotate(geom="text", x=3.8, y=1, label=paste0("p = " , round(sig, digits = 4)), color="red")
+
+
+```
+
+# T cell subtype abundances
+
+### Calculate Aitchison distance between matched samples
+
+For PTs with multiple matched metastatic sites, these sites are pooled before calculating the Aitchison distance between sample pairs.
+
+
+```{r Tcell-aitchison}
+sce_T <- filterSCE(sce_immune_intra, Tcell_subtype != "none")
+sce_met <- filterSCE(sce_T,Tissue.Type!="PT")
+sce_PT <- filterSCE(sce_T,Tissue.Type=="PT")
+
+ncs_met <- table(sce_met$patient.MetPT, sce_met$Tcell_subtype)
+ncs_PT <- table(sce_PT$patient.MetPT, sce_PT$Tcell_subtype)
+
+# Include only samples with > 6 T cells
+ncs_met <- ncs_met[rowSums(ncs_met) > 6,]
+ncs_PT <- ncs_PT[rowSums(ncs_PT) > 6,]
+
+# Calculate centered log-transform of abundances
+fqs_met  <- log(prop.table(ncs_met + 1, 1), 2)
+clr_met  <- as.data.frame.matrix(fqs_met-rowMeans(fqs_met))
+fqs_PT <- log(prop.table(ncs_PT+ 1, 1), 2)
+clr_PT <- as.data.frame.matrix(fqs_PT-rowMeans(fqs_PT))
+
+clr_met$patient.MetPT <- rownames(clr_met)
+clr_met <- separate(clr_met, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+clr_PT$patient.MetPT <- rownames(clr_PT)
+clr_PT <- separate(clr_PT, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+
+# Create empty dissimilarity data frame
+diss.obs <- as.data.frame(matrix(ncol = 2, nrow = length(rownames(clr_met)), dimnames = list(rownames(clr_met), c("patient.MetPT", "diss_to_PT"))))
+
+# Loop over metastatic tissues and compute dissimilarity to matched PT
+for(i in rownames(clr_met)){
+ patientID <- clr_met[i,"patient"]
+ abundances <- rbind(clr_met[i,], filter(clr_PT, patient == patientID))
+ if(nrow(abundances) == 2) {
+   diss <- vegdist(abundances[,1:6],method = 'euclidean', binary = FALSE,na.rm = TRUE)
+    diss.obs[i,] <- c(i, diss)
+ }
+}
+
+# Remove NAs (samples for which no PT data is available)
+diss.obs <- na.exclude(diss.obs)
+
+diss.obs <- separate(diss.obs, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+diss.obs$diss_to_PT <- as.numeric(diss.obs$diss_to_PT)
+diss.obs$site.of.metastasis <- sample_unique$Site.of.metastasis[match(diss.obs$patient, sample_unique$Patient.ID)]
+
+```
+
+### Random matching of Mets to other Mets of the same site
+
+```{r Tcell-permutations}
+
+# Create empty data frame for 1000 permutations
+diss.perm <- as.data.frame(matrix(ncol = 1000, nrow = length(rownames(diss.obs)), dimnames = list(rownames(diss.obs), c(1:1000))))
+
+
+# Loop for permutations
+for (zz in 1:1000) {
+  
+  # Loop over metastatic tissues and compute dissimilarity to random other metastatis from the same site
+  for(i in 1:length(rownames(diss.obs))){
+    sample <- rownames(diss.obs)[i]
+    site <- diss.obs[i, "site.of.metastasis"]
+    same.site <- filter(diss.obs[-i,], site.of.metastasis == site) ## remove the sample in question
+    random.sample <- sample(rownames(same.site))[1]
+    abundances <- rbind(clr_met[sample,1:11], clr_met[random.sample, 1:11])
+    
+    # Add to large permutation matrix
+    diss.perm[sample,zz] <- vegdist(abundances, method = 'euclidean', binary = FALSE,na.rm = TRUE)
+  }
+} 
+
+
+# Plot distribution of observed and distribution of permuted dissimilarity scores
+diss.perm.long <- reshape2::melt(diss.perm)
+diss.perm.long$type <- "permuted"
+diss.obs.long <- as.data.frame(diss.obs$diss_to_PT)
+colnames(diss.obs.long) <- "value"
+diss.obs.long$type <- "observed"
+diss.merged <- rbind(diss.perm.long[,2:3], diss.obs.long)
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+ks.test(diss.obs.long$value, diss.perm.long$value, alternative = "greater")
+
+# Plot distribution of permuted means
+obs.median <- median(diss.obs.long$value)
+perm.medians <- apply(diss.perm, MARGIN = 2, FUN = median)
+
+# Test for normal distribution of permuted medians
+shapiro.test(perm.medians)
+
+# Test probability of the observed median to be drawn from the distribution of permuted medians
+sig <- pnorm(obs.median, mean = mean(perm.medians), sd = sd(perm.medians))
+
+ggplot(as.data.frame(perm.medians),aes(x=perm.medians,..scaled..)) + 
+  geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=median(diss.obs.long$value), linetype="dashed")+theme(legend.position="top") +
+  annotate(geom="text", x=4.0, y=1, label=paste0("p = " , round(sig, digits = 6)), color="red")
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_histogram(aes(y=..density..), position="identity", alpha=0.3)+scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+```
+
+# Myeloid cell subtype abundances
+
+### Calculate Aitchison distance between matched samples
+
+For PTs with multiple matched metastatic sites, these sites are pooled before calculating the Aitchison distance between sample pairs.
+
+
+```{r myeloid-aitchison}
+sce_M <- filterSCE(sce_M_intra, M_cluster != "none")
+sce_met <- filterSCE(sce_M,Tissue.Type!="PT")
+sce_PT <- filterSCE(sce_M,Tissue.Type=="PT")
+
+ncs_met <- table(sce_met$patient.MetPT, sce_met$M_cluster)
+ncs_PT <- table(sce_PT$patient.MetPT, sce_PT$M_cluster)
+
+# Include only samples with > 10 myeloid cells
+ncs_met <- ncs_met[rowSums(ncs_met) > 10,]
+ncs_PT <- ncs_PT[rowSums(ncs_PT) > 10,]
+
+# Calculate centered log-transform of abundances
+fqs_met  <- log(prop.table(ncs_met + 1, 1), 2)
+clr_met  <- as.data.frame.matrix(fqs_met-rowMeans(fqs_met))
+fqs_PT <- log(prop.table(ncs_PT+ 1, 1), 2)
+clr_PT <- as.data.frame.matrix(fqs_PT-rowMeans(fqs_PT))
+
+clr_met$patient.MetPT <- rownames(clr_met)
+clr_met <- separate(clr_met, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+clr_PT$patient.MetPT <- rownames(clr_PT)
+clr_PT <- separate(clr_PT, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+
+
+# Create empty dissimilarity data frame
+diss.obs <- as.data.frame(matrix(ncol = 2, nrow = length(rownames(clr_met)), dimnames = list(rownames(clr_met), c("patient.MetPT", "diss_to_PT"))))
+
+# Loop over metastatic tissues and compute dissimilarity to matched PT
+for(i in rownames(clr_met)){
+ patientID <- clr_met[i,"patient"]
+ abundances <- rbind(clr_met[i,], filter(clr_PT, patient == patientID))
+ if(nrow(abundances) == 2) {
+   diss <- vegdist(abundances[,1:6],method = 'euclidean', binary = FALSE,na.rm = TRUE)
+    diss.obs[i,] <- c(i, diss)
+ }
+}
+
+# Remove NAs (samples for which no PT data is available)
+diss.obs <- na.exclude(diss.obs)
+
+diss.obs <- separate(diss.obs, patient.MetPT, into = c("patient", "MetPT"), sep = "_")
+diss.obs$diss_to_PT <- as.numeric(diss.obs$diss_to_PT)
+diss.obs$site.of.metastasis <- sample_unique$Site.of.metastasis[match(diss.obs$patient, sample_unique$Patient.ID)]
+```
+
+```{r myeloid-permutations}
+
+# Create empty data frame for 1000 permutations
+diss.perm <- as.data.frame(matrix(ncol = 1000, nrow = length(rownames(diss.obs)), dimnames = list(rownames(diss.obs), c(1:1000))))
+
+
+# Loop for permutations
+for (zz in 1:1000) {
+  
+  # Loop over metastatic tissues and compute dissimilarity to random other metastatis from the same site
+  for(i in 1:length(rownames(diss.obs))){
+    sample <- rownames(diss.obs)[i]
+    site <- diss.obs[i, "site.of.metastasis"]
+    same.site <- filter(diss.obs[-i,], site.of.metastasis == site) ## remove the sample in question
+    random.sample <- sample(rownames(same.site))[1]
+    abundances <- rbind(clr_met[sample,1:20], clr_met[random.sample, 1:20])
+    
+    # Add to large permutation matrix
+    diss.perm[sample,zz] <- vegdist(abundances, method = 'euclidean', binary = FALSE,na.rm = TRUE)
+  }
+} 
+
+
+# Plot distribution of observed and distribution of permuted dissimilarity scores
+diss.perm.long <- reshape2::melt(diss.perm)
+diss.perm.long$type <- "permuted"
+diss.obs.long <- as.data.frame(diss.obs$diss_to_PT)
+colnames(diss.obs.long) <- "value"
+diss.obs.long$type <- "observed"
+diss.merged <- rbind(diss.perm.long[,2:3], diss.obs.long)
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+
+ks.test(diss.obs.long$value, diss.perm.long$value, alternative = "greater")
+
+# Plot distribution of permuted means
+obs.median <- median(diss.obs.long$value)
+perm.medians <- apply(diss.perm, MARGIN = 2, FUN = median)
+
+# Test for normal distribution of permuted medians
+shapiro.test(perm.medians)
+
+# Test probability of the observed median to be drawn from the distribution of permuted medians
+sig <- pnorm(obs.median, mean = mean(perm.medians), sd = sd(perm.medians))
+
+ggplot(as.data.frame(perm.medians),aes(x=perm.medians,..scaled..)) + 
+  geom_density()+ scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=median(diss.obs.long$value), linetype="dashed")+theme(legend.position="top") +
+  annotate(geom="text", x=4.0, y=1, label=paste0("p = " , round(sig, digits = 6)), color="red")
+
+ggplot(diss.merged,aes(x=value, color=type,..scaled..)) + geom_histogram(aes(y=..density..), position="identity", alpha=0.3)+scale_color_manual(values=c("#E69F00", "#56B4E9"))+theme_classic()+
+  geom_vline(xintercept=mean(diss.obs.long$value, color=type[1]),
+             linetype="dashed")+theme(legend.position="top")
+```
+

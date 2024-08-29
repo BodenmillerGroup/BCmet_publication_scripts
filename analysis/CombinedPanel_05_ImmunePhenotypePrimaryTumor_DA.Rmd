@@ -1,0 +1,524 @@
+---
+title: "Combined_Fig6_ImmunePhenotypePrimaryTumor_DA"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+## Introduction
+
+This script check for differences between inflamed and excluded primary tumors
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+
+First, we will load the needed libraries and the `SingleCellExperiment` object, that was created in the previous section.
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(compositions)
+library(vegan)
+library(ComplexHeatmap)
+
+```
+
+### Load local functions(modified from the CATALYST package)
+
+```{r}
+local_split_cells <- function(x, by) {
+    stopifnot(is.character(by), by %in% colnames(colData(x)))
+    cd <- as.data.frame(colData(x))
+    dt <- data.table::data.table(cd, i = seq_len(ncol(x)))
+    dt_split <- split(dt, by = by, sorted = TRUE, flatten = FALSE)
+    purrr::map_depth(dt_split, length(by), "i")
+}
+
+local_agg <- function(x, 
+    by = c("cluster_id", "sample_id"), 
+    fun = c("median", "mean", "sum"),
+    assay = "exprs") {
+    fun <- match.arg(fun)
+    y <- assay(x, assay)
+    if (fun == "median" && !is.matrix(y))
+        y <- as.matrix(y)
+    fun <- switch(fun, 
+        median = rowMedians, 
+        mean = rowMeans, 
+        sum = rowSums)
+    cs <- local_split_cells(x, by)
+    pb <- map_depth(cs, -1, function(i) {
+        if (length(i) == 0) return(numeric(nrow(x)))
+        fun(y[, i, drop = FALSE])
+    })
+    purrr::map_depth(pb, -2, function(u) as.matrix(data.frame(
+        u, row.names = rownames(x), check.names = FALSE)))
+}
+
+
+```
+
+
+### Load T cell panel
+
+```{r}
+sce <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+
+sce$patient.tissue <- paste(sce$Patient.ID, sce$Tissue.Type, sep = "_")
+sce$patient.tissue.loc <- paste(sce$patient.tissue, sce$Location, sep = "_")
+
+# Read in ROI metadata
+ROI_meta <- read.csv("data/immune_images_patient_metadata.csv")
+ROI_meta$patient.tissue <- paste(ROI_meta$Patient.ID, ROI_meta$Tissue.Type, sep = "_")
+sample_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue),]
+rownames(sample_unique) <- sample_unique$patient.tissue
+
+ROI_meta$patient.tissue.loc <- paste(ROI_meta$patient.tissue, ROI_meta$Location, sep = "_")
+ROI_unique <- ROI_meta[!duplicated(ROI_meta$patient.tissue.loc),]
+rownames(ROI_unique) <- ROI_unique$patient.tissue.loc
+
+#set up factors for CATALYST PACKAGE
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+
+# Set up necessary fields for CATALYST plotting functions
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type))
+sce$Tissue.Type <- factor(sce$Tissue.Type)
+sce$Site.of.metastasis <- factor(sce$Site.of.metastasis)
+sce$Location <- factor(sce$Location)
+sce$Tcell_subtype <- as.factor(sce$Tcell_subtype)
+sce$Tcell_cluster <- factor(sce$Tcell_cluster)
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+
+
+immune_pheno$immunePT_Met[immune_pheno$immunePT_Met=="x_desert"] <- "desert"
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+sce_initial <- sce
+# Subset immune cells
+sce <- sce_initial[,which(sce_initial$cell_class == "immune")]
+sce$celltype <- ifelse(sce$celltype == "T_cell", sce$clustername, sce$celltype)
+
+
+```
+
+
+### Display patient tissue immune phenotypes in PT and Met
+
+```{r alluvial-plot-tissue-immune-phenotype}
+library(ggalluvial)
+
+# Exclude the one patient whose metastatic sites have different annotations
+patho1 <- immune_pheno[immune_pheno$Patient.ID != "ID17",]
+
+patho1$links <- paste(patho1$immunePT_PT, patho1$immunePT_Met, sep = "_")
+links <- as.data.frame(table(patho1$links))
+links <- separate(links, 1, into = c("PT", "Met"), sep = "_" )
+links$subject <- c(1:5)
+
+patho2 <- pivot_longer(links, 1:2, names_to = "tissue", values_to = "type")
+patho2$tissue <- factor(patho2$tissue, level = c("PT", "Met"))
+
+ggplot(patho2,
+       aes(x = tissue, stratum = type, alluvium = subject, y = Freq, fill = type, label = type)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  scale_fill_manual(values = c("grey", "orange", "darkred"))+
+  geom_flow(alpha = .3) +
+  geom_stratum(alpha = .5) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none", panel.background=element_blank())
+
+
+
+```
+
+
+### Barplot to show which metastatic sites have which T cell infiltration status
+```{r bar-plot-immune-tissue-phenotype}
+patho_long <- pivot_longer(patho1, 15:16, names_to = "MetPT", values_to = "ImPh")
+patho_long$MetPT <- factor(patho_long$MetPT, levels =c("immunePT_PT","immunePT_Met"))
+colors <- sce@metadata$colour_vectors$tissuetype
+names(colors)[1] <- "Soft Tissue"
+colors["Multiple"] <- "darkgreen"
+colors <- colors[colors != "#4C9900"]
+
+ggplot(patho_long, aes(ImPh, fill = Site.of.metastasis))+
+  geom_bar(position = "stack")+
+  scale_fill_manual(values = colors)+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))+
+  facet_wrap(~MetPT)
+```
+
+
+### Check DA for general immune cell subtypes
+```{r inflamed-excluded-DA-immune-cells-intratumoral}
+
+sce$cluster_id <- factor(sce$celltype)
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce_filtered1 <- filterSCE(sce, sample_type =="PT")
+sce_filtered <- filterSCE(sce_filtered1, Location =="intratumoral")
+i = "Excluded "
+
+# Prepare abundance object
+abundances <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_filtered)[match(colnames(abundances), sce_filtered$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+immunePT_PT <- factor(meta$immunePT_PT)
+meta$immunePT_PT <- relevel(x=immunePT_PT, ref = "excluded")
+y.ab <- DGEList(abundances, samples=meta,remove.zeros = TRUE,group = meta$immunePT_PT)
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~immunePT_PT, data = y.ab$samples)
+
+# Calculate Normalization Factors to adjust for composition effect (this assumes that most cell type populations stay constant, which is not necessarily true)
+y.ab <- calcNormFactors(y.ab)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=ncol(fit.ab))
+summary(decideTests(res))
+DA <- topTags(res, n = nrow(abundances))$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs inflamed"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+
+# Test if acquired regions mirror the slide-wide immune phenotype classification
+
+### Prepare spatial object relationship data
+
+```{r object-relationships}
+
+# Read object relationship file (output from Cellprofiler)
+dat_relation <- data.table::fread("data/immune_Object relationships.csv")
+dat_relation$cellA <- paste0(dat_relation$`First Image Number`, "_", dat_relation$`First Object Number`)
+dat_relation$cellB <- paste0(dat_relation$`Second Image Number`, "_", dat_relation$`Second Object Number`)
+```
+
+```{r ROI-immune-phenotypes-withoutMargin, fig.width=4, fig.height=5}
+
+patho_short <- patho1[,c(1,15,16)]
+colnames(patho_short) <- c("Patient.ID", "PT", "M")
+patho_short <- pivot_longer(patho_short, 2:3, names_to = "site", values_to = "imPh")
+patho_short$patient.site <- paste(patho_short$Patient.ID, patho_short$site, sep = " ")
+
+# Exclude patients not present in the pathology list
+sce_sub <- sce_initial[,which(sce_initial$Patient.ID %in% patho1$Patient.ID)]
+
+sce_sub$imPh <- patho_short$imPh[match(sce_sub$sample_id, patho_short$patient.site)]
+
+#exclude margin images
+sce_nomarg <- sce_sub[,which(sce_sub$Location == "intratumoral")]
+
+cur_sce <- data.frame(colData(sce_nomarg))
+df <- data.frame(matrix(nrow=0, ncol =4))
+
+for (i in unique(cur_sce$sample_id)){
+  cur_sce_i <- cur_sce[cur_sce[,"sample_id"] == i,]
+  
+  # get T cell and tumor cell IDs
+  cellIDs_Tcell <- cur_sce_i[cur_sce_i[,"clustername"] == "T_CD8",]
+  Tcell_shortID <- paste0(cellIDs_Tcell$ImageNumber, "_", cellIDs_Tcell$CellNumber)
+  cellIDs_tumor <- cur_sce_i[cur_sce_i[,"celltype"] == "epithelial",]
+  tumor_shortID <- paste0(cellIDs_tumor$ImageNumber, "_", cellIDs_tumor$CellNumber)
+  
+  # subset neighbourhood list to include only `T cell <-> tumor cell` interactions
+  dat_relation_sub <- dat_relation %>% filter((cellA %in% Tcell_shortID & cellB %in% tumor_shortID))
+  # count interactions
+  intnr_i <- nrow(dat_relation_sub)
+  
+  # divide through T cell nr
+  intnr_Tcell_prop <- intnr_i/length(Tcell_shortID)
+  # divide through T cell nr
+  intnr_tumor_prop <- intnr_i/length(tumor_shortID)
+  
+  new_row <- c(i, intnr_i, intnr_Tcell_prop, intnr_tumor_prop)
+  df <- rbind(df, new_row)
+} 
+
+colnames(df) <- c("patient.site", "total_interactions", "Tcell_prop", "tumor_prop")
+df[,2:4] <- df[,2:4] %>% mutate_if(is.character,as.numeric)
+
+df_merged <- merge(df, patho_short, by = "patient.site")
+
+
+
+### Direct T cell interactions per tumor cell
+my_comparisons <- list( c("inflamed", "excluded"), c("inflamed", "desert"), c("desert", "excluded"))
+
+ggplot(df_merged, aes(imPh, tumor_prop))+
+    geom_boxplot()+
+    geom_point(position=position_dodge(width=0.75))+
+    stat_compare_means(method = "wilcox.test", aes(label=..p.format..), comparisons = my_comparisons)+
+    theme(axis.line.x = element_line(colour = "black", size = 0.25),
+        axis.line.y = element_line(colour = "black", size = 0.25),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1),
+        panel.background = element_blank(),
+        strip.background = element_blank()) + ggtitle("Average number of direct CD8+ T cell \ninteractions per tumor cell")
+
+
+```
+
+
+
+
+## Check DA between inflamed and exhausted phenotype for T cell metaclusters in intratumoral region
+
+```{r inflamed-excluded-DA-intratumoral-Tcells}
+
+sce$cluster_id <- sce$Tcell_subtype
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce_filtered1 <- filterSCE(sce, sample_type =="PT")
+sce_filtered2 <- filterSCE(sce_filtered1, cluster_id !="none")
+sce_filtered <- filterSCE(sce_filtered2, Location =="intratumoral")
+
+i = "Excluded "
+
+# Prepare abundance object
+abundances <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_filtered)[match(colnames(abundances), sce_filtered$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+immunePT_PT <- factor(meta$immunePT_PT)
+meta$immunePT_PT <- relevel(x=immunePT_PT, ref = "excluded")
+y.ab <- DGEList(abundances, samples=meta,remove.zeros = TRUE,group = meta$immunePT_PT)
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~immunePT_PT, data = y.ab$samples)
+# Calculate Normalization Factors to adjust for composition effect (this assumes that most cell type populations stay constant, which is not necessarily true)
+y.ab <- calcNormFactors(y.ab)
+
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=ncol(fit.ab))
+summary(decideTests(res))
+DA <- topTags(res, n = nrow(abundances))$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs inflamed"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+
+### Load macrophage panel
+```{r}
+
+sce_i <- readRDS("output/SCEs/myeloid/myeloidSCE_subclustered.rds")
+
+#Remove patient 80 due to too few cells
+sce_i <- sce_i[,sce_i$Patient.ID != "ID80"]
+
+sce2 <- filterSCE(sce_i,cell_class=="immune")
+sce2$cluster_id <- factor(sce2$M_cluster)
+
+markers_to_analyse<- c("CD38", "HLA-DR", "CLEC9A", "CD68", "CD163", "CD11b", "CD204", "GLUT1", "CD11c", "CD1c", "CD16", "MMP9", "CD274", "STING", "IDO", "CD33", "Arginase-1", "CD209", "CD40", "CD4", "CD14", "CD206", "LAMP3", "MPO", "CD303")
+
+sce <- filterSCE(sce2, rownames(sce2) %in% markers_to_analyse)
+
+
+#set up factors for CATALYST PACKAGE
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+# Set up necessary fields for CATALYST plotting functions
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type))
+
+
+sce$Tissue.Type <- factor(sce$Tissue.Type)
+sce$Site.of.metastasis <- factor(sce$Site.of.metastasis)
+sce$Location <- factor(sce$Location)
+sce$clustername <- as.factor(sce$clustername)
+sce$M_cluster <- as.factor(sce$M_cluster)
+
+sce$cluster_id<- as.factor(sce$M_cluster)
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+```
+
+### DA for macrophage subtypes in non-margin region
+
+```{r myeloid-cell-DA-inflamed-excluded-intratumoral}
+sce_filtered1 <- filterSCE(sce, sample_type =="PT")
+sce_filtered2 <- filterSCE(sce_filtered1, Location !="margin")
+sce_filtered <- filterSCE(sce_filtered2, cluster_id !="none")
+
+
+i = "Excluded "
+
+# Prepare abundance object
+abundances <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_filtered)[match(colnames(abundances), sce_filtered$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+immunePT_PT <- factor(meta$immunePT_PT)
+meta$immunePT_PT <- relevel(x=immunePT_PT, ref = "excluded")
+y.ab <- DGEList(abundances, samples=meta,remove.zeros = TRUE,group = meta$immunePT_PT)
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~immunePT_PT, data = y.ab$samples)
+
+# Calculate Normalization Factors to adjust for composition effect (this assumes that most cell type populations stay constant, which is not necessarily true)
+y.ab <- calcNormFactors(y.ab)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=ncol(fit.ab))
+summary(decideTests(res))
+DA <- topTags(res, n = nrow(abundances))$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs inflamed"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+### Compare epithelial cell expression
+```{r inflamed-excluded-DA-intratumoral-tumor-cells}
+
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1","Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7", 
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce4 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+
+counts_per_sample <- table(sce_epithelial$sample_type, sce_epithelial$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<50)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+sce_tumor <- filterSCE(sce4,!(sce4$Patient.ID %in% patient_to_exclude))
+
+#add immune phenotyping information
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce_tumor$Patient.ID, immune_pheno$Patient.ID)]
+sce_tumor$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce_tumor$Patient.ID, immune_pheno$Patient.ID)]
+sce_tumor$immunePT_Met <- factor(immune_pheno_name1)
+
+#Repeat tissue type as condition for plotting functions in CATALYST
+sce_tumor$condition <- factor(sce_tumor$immunePT_PT)
+sce_tumor$Patient.ID <- factor(sce_tumor$Patient.ID)
+sce_tumor$Location <- factor(sce_tumor$Location)
+
+sce_filtered <- filterSCE(sce_tumor, sample_type =="PT")
+
+i = "Excluded "
+
+# Prepare abundance object
+abundances <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances <- unclass(abundances) 
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_filtered)[match(colnames(abundances), sce_filtered$Patient.ID),]
+rownames(meta) <- meta$Patient.ID
+immunePT_PT <- factor(meta$immunePT_PT)
+meta$immunePT_PT <- relevel(x=immunePT_PT, ref = "excluded")
+y.ab <- DGEList(abundances, samples=meta,remove.zeros = TRUE,group = meta$immunePT_PT)
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~immunePT_PT, data = y.ab$samples)
+
+# Calculate Normalization Factors to adjust for composition effect (this assumes that most cell type populations stay constant, which is not necessarily true)
+y.ab <- calcNormFactors(y.ab)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=ncol(fit.ab))
+summary(decideTests(res))
+DA <- topTags(res, n = nrow(abundances))$table
+DA$celltype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs inflamed"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+

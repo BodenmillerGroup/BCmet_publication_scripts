@@ -1,0 +1,46 @@
+---
+title: "TumorPanel_08_spatial_analysis"
+author: "LauraKuett"
+date: "02/05/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries and data
+
+I will read in the T cell `SingleCellExperiment` object and work with the full
+data.
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(imcRtools)
+library(tidyverse)
+library(S4Vectors)
+library(ggalluvial)
+library(pheatmap)
+library(viridis)
+library(compositions)
+library(Rphenograph)
+library(edgeR)
+library(tidyverse)
+
+# Read SingleCellExperiment object with subclustered T cells and subset T cells only
+sce <- readRDS("~/switchdrive/Institution/BCmet/BCmet_pub/output/SCEs/Tcell/TcellSCE_subclustered.rds")
+
+# Interaction information
+neighbours <- read_csv("~/switchdrive/Institution/BCmet/BCmet_pub/data/immune_Object relationships.csv")
+from_nodes <- paste0(neighbours$`First Image Number`, "_", neighbours$`First Object Number`)
+to_nodes <- paste0(neighbours$`Second Image Number`, "_", neighbours$`Second Object Number`)
+cell_ids <- paste0(sce$ImageNumber, "_", sce$CellNumber)
+
+from_nodes <- match(from_nodes, cell_ids)
+to_nodes <- match(to_nodes, cell_ids)
+
+cur_pairs <- SelfHits(from = from_nodes[!is.na(from_nodes) & !is.na(to_nodes)],
+                      to = to_nodes[!is.na(from_nodes) & !is.na(to_nodes)],
+                      nnode = length(cell_ids))
+colPair(sce, "neighbours") <- cur_pairs

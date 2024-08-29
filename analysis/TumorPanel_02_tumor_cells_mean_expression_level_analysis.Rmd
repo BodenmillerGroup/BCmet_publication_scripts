@@ -1,0 +1,971 @@
+---
+title: "TumorPanel_02_tumor_cells_mean_expression_level_analysis"
+author: "laurakutt"
+date: "2021-03-25"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Introduction
+This script provides an analysis of epithelial cells as a subclass from the tumor panel initial clustering step. 
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(GGally)
+```
+
+
+```{r}
+# Read SingleCellExperiment object
+#setwd("projects/BCmet/workflowr_publication/BCmet_pub")
+sce1  <- readRDS("output/SCEs/tumor/tumorSCE_initial_clustered.rds")
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1","Bcl-2" ,"HER2", "CK5" ,"CD274", 
+                     "AR","GATA3","CK7", "CAIX" ,"Fibronectin", "Ki-67_Er168",
+                     "EGFR","p-S6","mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce_initial <- filterSCE(sce1, rownames(sce1) %in% markers_to_analyse)
+
+#filter only patients with matched samples
+sce_initial <-filterSCE(sce_initial, matched_samples==1)
+
+#Convert metadata into factors
+sce_initial$N <- factor(sce_initial$N)
+sce_initial$T <- factor(sce_initial$T)
+sce_initial$M <- factor(sce_initial$M)
+sce_initial$Grade <- factor(sce_initial$Grade)
+sce_initial$Tissue.Type <- factor(sce_initial$Tissue.Type)
+sce_initial$Tissue.Type <- relevel(sce_initial$Tissue.Type, "PT")
+sce_initial$PT <- factor(sce_initial$PT)
+sce_initial$ER <- factor(sce_initial$ER)
+sce_initial$PR <- factor(sce_initial$PR)
+sce_initial$Her2 <- factor(sce_initial$Her2)
+sce_initial$Site.of.metastasis <- factor(sce_initial$Site.of.metastasis)
+sce_initial$molecular.subtype <- factor(sce_initial$molecular.subtype)
+
+
+#set up new factor
+sce_initial$sample_type[sce_initial$Tissue.Type == 'PT'] <- "PT"
+sce_initial$sample_type[sce_initial$Tissue.Type == 'Liver' ] <- "M"
+sce_initial$sample_type[sce_initial$Tissue.Type == 'Bone'] <- "M"
+sce_initial$sample_type[sce_initial$Tissue.Type == 'Brain'] <- "M"
+sce_initial$sample_type[sce_initial$Tissue.Type == 'SoftTissue'] <- "M"
+sce_initial$sample_type <- factor(sce_initial$sample_type)
+
+# Set up necessary fields for CATALYST plotting functions
+sce_initial$sample_id <- factor(paste(sce_initial$Patient.ID, sce_initial$sample_type))
+
+immune_pheno <- read.csv("data/patient_metadata_encoded.csv")
+
+sce_initial$sample_type <- relevel(sce_initial$sample_type, "PT")
+
+```
+
+```{r example-images-cluster-frequencies}
+library(cytomapper)
+
+path.to.images <- "data/example_tumor_masks/"
+all_masks <- loadImages(path.to.images, pattern = "_mask.tiff")
+all_masks
+
+#Add image number
+mcols(all_masks)$ROI_ID <-c("TMA265_ROI_n09_tumor","TMA265_ROI_n10_tumor","TMA265_ROI_f14_tumor","TMA265_ROI_n16_tumor",
+                            "TMA265_ROI_f15_tumor", "TMA265_ROI_f19_tumor","TMA265_ROI_f20_tumor", "TMA265_ROI_c22_tumor")
+# Scale images
+all_masks <- scaleImages(all_masks, 2^16-1)
+
+cl_colors = list(celltype = c(
+    "B-cells" = "#a92af7", "CD4 T-cells" = "#0a911c", "CD8 T-cells" = "#0a911c", "Endothelial" ="#ed6c09", 
+    "Epithelial"="#62b5bd" , "Myeloid"="#f51818" , "Stroma"= "#293dcf", "undefined"= "#a0a3a1" ))
+
+
+#Figure 1g tumor segmented image: TMA265_ROI_c22 20200730_ZTMA_265_rows_22_28_s0_a3
+
+cur_img <- getImages(all_masks, "20200730_ZTMA_265_rows_22_28_s0_a3_ac_ilastik_s2_Probabilities_mask")
+plotCells(cur_img, object = sce_initial,
+            img_id = "ROI_ID", cell_id = "CellNumber",
+            colour_by = "celltype",
+          colour =cl_colors, 
+          scale_bar = NULL,
+          image_title = NULL)
+
+
+```
+
+
+
+
+### Analyze epithelial cells only
+
+```{r}
+sce <- filterSCE(sce_initial, celltype == "Epithelial")
+
+# for plotting purposes change the allocation of state and type markers
+#CATALYST packages plots state and type markers separately
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+all_markers <- rownames(rowData(sce))
+clustering_cols <- match(clustering_markers,all_markers)
+marker_class <- rep("type", length(rownames(rowData(sce))))
+marker_class[clustering_cols] <- "state"
+marker_class <- factor(marker_class, levels = c("type", "state"))
+rowData(sce)$marker_class <- marker_class
+
+sce$condition <- sce$sample_type
+
+```
+
+
+
+# Add local functions for plotting purposes (taken from CATALYST packages)
+```{r}
+#local functions from https://github.com/HelenaLC/CATALYST/blob/54bd90dedcef529b59cf13aa72a84eb63e669af9/R/plotExprHeatmap.R
+local_split_cells <- function(x, by) {
+    stopifnot(is.character(by), by %in% colnames(colData(x)))
+    cd <- as.data.frame(colData(x))
+    dt <- data.table::data.table(cd, i = seq_len(ncol(x)))
+    dt_split <- split(dt, by = by, sorted = TRUE, flatten = FALSE)
+    purrr::map_depth(dt_split, length(by), "i")
+}
+
+local_agg <- function(x, 
+    by = c("cluster_id", "sample_id"), 
+    fun = c("median", "mean", "sum"),
+    assay = "exprs") {
+    fun <- match.arg(fun)
+    y <- assay(x, assay)
+    if (fun == "median" && !is.matrix(y))
+        y <- as.matrix(y)
+    fun <- switch(fun, 
+        median = rowMedians, 
+        mean = rowMeans, 
+        sum = rowSums)
+    cs <- local_split_cells(x, by)
+    pb <- purrr::map_depth(cs, -1, function(i) {
+        if (length(i) == 0) return(numeric(nrow(x)))
+        fun(y[, i, drop = FALSE])
+    })
+    purrr::map_depth(pb, -2, function(u) as.matrix(data.frame(
+        u, row.names = rownames(x), check.names = FALSE)))
+}
+
+#Function taken from CATALYST package: https://github.com/HelenaLC/CATALYST/blob/54bd90dedcef529b59cf13aa72a84eb63e669af9/R/utils-differential.R#L163
+annoCounts <- function(x, perc) {
+    ns <- table(x)
+    fq <- round(ns/sum(ns)*100, 2)
+    if (perc) {
+        txt <- sprintf("%s%%(%s)", fq, names(fq))
+        foo <- row_anno_text(txt, 
+            just = "center", 
+            gp = gpar(fontsize = 8),  
+            location = unit(0.5, "npc"))
+    } else foo <- NULL
+    rowAnnotation(
+        "n_cells" = row_anno_barplot(
+            x = as.matrix(ns), width = unit(2, "cm"),
+            gp = gpar(fill = "grey", col = "white"),
+            border = FALSE, axis = TRUE, bar_width = 0.8),
+        "foo" = foo)
+}
+```
+
+
+### Mean expression level heatmap for primary tumors 
+```{r heatmap-per-patient-mean-expression-pt, fig.width=15, fig.height=10}
+library(ComplexHeatmap)
+patient_level_md <- read.csv("data/patient_metadata_encoded.csv")
+rownames(patient_level_md) <- patient_level_md$Patient.ID
+
+sce_filtered <- filterSCE(sce, sample_type == "PT")
+patient_means_pt <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+patient_means_pt <- patient_means_pt[ !(rownames(patient_means_pt) %in% c("HH3","H3K27me3", "SMA")), ] 
+diversity_metadata <- patient_level_md[rownames(patient_level_md) %in% colnames(patient_means_pt), ] 
+
+ann <- data.frame(diversity_metadata$Patient.ID, diversity_metadata$molecular.subtype, diversity_metadata$Site.of.metastasis)
+rownames(ann)<- ann$diversity_metadata.Patient.ID
+ann<- ann[,-1]
+ann<- ann[match(colnames(patient_means_pt), rownames(ann)),]
+
+colnames(ann) <- c('Molecular.subtype', 'Site.of.metastasis')
+colours <- list('Molecular.subtype' =c('luminal B' = "#00AFBB", 'luminal A' = "#E7B800", 'Her2' =  "#FC4E07", 'TN' = "gray"), 
+                'Site.of.metastasis' = c('Brain' = "#AC16AC", 'Liver' = "#FF3333", 'Bone' = "#FF8000", 
+                                         'Soft Tissue' = "#CCCC00" , 'Multiple' = "#4C9900"))
+
+
+colAnn <- HeatmapAnnotation(df = ann,
+  which = 'col',
+  col = colours,
+  annotation_width = unit(c(1, 4), 'cm'),
+  gap = unit(1, 'mm'))
+
+col<- colorRampPalette(c("white", "blue", "red"),space = "Lab")(100)
+
+ht <- Heatmap(patient_means_pt, name = "PT",
+  col = col, 
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_dend = TRUE,
+  show_row_dend = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  row_dend_reorder = TRUE,
+  column_dend_reorder = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  clustering_distance_columns = "pearson",
+  clustering_distance_rows = "pearson",
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete",
+  top_annotation=colAnn)
+ht = draw(ht)
+```
+
+### Heatmap for mean expression per patient for metastatic samples
+
+```{r heatmap-per-patient-mean-expression-metastasis, fig.width=15, fig.height=10}
+###In metastasis
+sce_filtered <- filterSCE(sce, sample_type == "M")
+patient_means_met <- local_agg(sce_filtered,by= 'Patient.ID', fun = 'mean',assay ="normalized")
+
+patient_means_met <- patient_means_met[ !(rownames(patient_means_met) %in% c("HH3","H3K27me3", "SMA")), ] 
+
+
+ht <- Heatmap(patient_means_met, name = "Met",
+  col = col, 
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_dend = TRUE,
+  show_row_dend = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  row_dend_reorder = TRUE,
+  column_dend_reorder = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  clustering_distance_columns = "pearson",
+  clustering_distance_rows = "pearson",
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete",
+  top_annotation=colAnn)
+ht = draw(ht)
+```
+
+### Heatmap of mean expression level difference between metastatic and tumor sample
+
+```{r heatmap-per-patient-difference-mean-expression-met-pt, fig.width=15, fig.height=10}
+###heatmap with difference in means
+
+delta_mean_x <- patient_means_met-patient_means_pt
+col<- colorRampPalette(c("blue","white", "red"),space = "Lab")(100)
+
+
+ht <- Heatmap(delta_mean_x, name = "Delta",
+  col = col, 
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_dend = TRUE,
+  show_row_dend = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  row_dend_reorder = TRUE,
+  column_dend_reorder = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  clustering_distance_columns = "pearson",
+  clustering_distance_rows = "pearson",
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete",
+  top_annotation=colAnn)
+ht = draw(ht)
+
+
+```
+
+### Plot paired marker expression between PT and Met
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells, fig.width=15, fig.height=10}
+# aggregation
+ms_tabel <- local_agg(sce, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+
+# add metadata information
+i <- match(df_agg$sample_id, sce$sample_id)
+df_agg <- cbind(df_agg, colData(sce)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "bonferroni") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=7) + ylab("normalized mean expression")+
+   theme_bw() +geom_line(aes(group = Patient.ID), color="darkgray")+ theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+
+```
+
+
+
+
+### Plot paired marker expression between PT and Met per molecular subtype
+
+# Luminal B
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-luminalB, fig.width=15, fig.height=10}
+# aggregation
+sce_filtered <- filterSCE(sce, molecular.subtype == "luminal B")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "bonferroni") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID),color="darkgray")+ theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+# Luminal A
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-luminalA, fig.width=15, fig.height=10}
+sce_filtered <- filterSCE(sce, molecular.subtype == "luminal A")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID), color="darkgray")+theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+# Her2
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-her2, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, molecular.subtype == "Her2")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID), color="darkgray")+ theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+# TN
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-tripleNegative, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, molecular.subtype == "TN")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID), color="darkgray")+theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+# Bone
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-Bone, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, Site.of.metastasis == "Bone")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() +geom_line(aes(group = Patient.ID), color="darkgray")+ theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+# Brain
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-Brain, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, Site.of.metastasis == "Brain")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() +geom_line(aes(group = Patient.ID), color="darkgray")+ theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+# Liver
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-Liver, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, Site.of.metastasis == "Liver")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID), color="darkgray")+theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+
+# SoftTissue
+
+```{r paired-PT-metastasis-aggregate-mean-marker-expression-epithelial-cells-softTissue, fig.width=15, fig.height=10}
+
+sce_filtered <- filterSCE(sce, Site.of.metastasis == "SoftTissue")
+
+ms_tabel <- local_agg(sce_filtered, "sample_id","mean", "normalized")
+df_agg <- reshape::melt(ms_tabel, varnames = c("antigen", "sample_id"))
+# add metadata information
+i <- match(df_agg$sample_id, sce_filtered$sample_id)
+df_agg <- cbind(df_agg, colData(sce_filtered)[i, c("Patient.ID", "condition")])
+
+
+df_p_val <- df_agg %>% 
+  rstatix::group_by(antigen) %>% 
+  rstatix::wilcox_test(value ~ condition, paired = TRUE) %>% 
+  rstatix::adjust_pvalue(p.col = "p", method = "BH") %>%
+  rstatix::add_xy_position()
+
+df_p_val$condition <- df_p_val$groups
+df_p_val$y.position <- df_p_val$y.position-0.2
+df_p_val$p.adj <- round(df_p_val$p.adj,6)
+
+p <- ggplot(df_agg, aes(x = condition, y = value)) + 
+  geom_boxplot(alpha = 0.4, width = 0.8, fill = NA, show.legend = FALSE) + 
+  facet_wrap(~ antigen, scales = "free",ncol=4) + ylab("normalized mean expression")+
+   theme_bw() + geom_line(aes(group = Patient.ID), color="darkgray")+theme(
+        legend.key.height  =  unit(0.8, "lines"),
+        axis.text = element_text(color = "black"),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = NA, color = NA),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey", size = 0.2))
+
+p+ ggprism::add_pvalue(df_p_val,xmin = "group1", xmax = "group2",label ="p = {p.adj}", y.position = "y.position", remove.bracket = TRUE)
+```
+
+
+### Examine pairwise correlations for each marker betewwn the primary tumor and metastatic site for all patient
+
+```{r mean-expression-per-patient-per-marker}
+sce$sample_id <- factor(sce$Patient.ID)
+sce_filtered_type <- filterSCE(sce,Tissue.Type=="PT")
+ 
+patient_value_aggregates <- as.data.frame(t(local_agg(sce_filtered_type, by= 'sample_id', fun = 'mean')))
+colnames(patient_value_aggregates) <- paste("PT", colnames(patient_value_aggregates), sep = "_")
+patient_value_aggregates["Patient.ID"] <- rownames(patient_value_aggregates)
+ 
+sce_filtered_type <- filterSCE(sce,Tissue.Type!="PT")
+ 
+patient_value_aggregates2 <- as.data.frame(t(local_agg(sce_filtered_type, by= 'sample_id', fun = 'mean')))
+colnames(patient_value_aggregates2) <- paste("met", colnames(patient_value_aggregates2), sep = "_")
+patient_value_aggregates2["Patient.ID"] <- rownames(patient_value_aggregates2)
+ 
+aggregate_value_table <- merge(patient_value_aggregates,patient_value_aggregates2, by = 'Patient.ID')
+ 
+```
+
+```{r pairwise-scatter-plot-per-marker-mean-sample-expression-pt-met, fig.width=17, fig.height=12}
+patient_value_aggregates_pt <- patient_value_aggregates
+patient_value_aggregates_met <- patient_value_aggregates2
+patient_value_aggregates_pt$Patient.ID <- NULL
+patient_value_aggregates_met$Patient.ID <- NULL
+
+same_anitgen_cor <- sapply(1:ncol(patient_value_aggregates_pt), 
+                           function(i) cor.test(patient_value_aggregates_pt[,i],patient_value_aggregates_met[,i],method = "pearson")$estimate)
+
+same_anitgen_cor <- data.frame(round(same_anitgen_cor,2))
+same_anitgen_cor$antigen <- gsub("PT_", "", colnames(patient_value_aggregates_pt))
+#same_anitgen_cor[order(same_anitgen_cor$same_anitgen_cor),]
+
+same_anitgen_p_value <- sapply(1:ncol(patient_value_aggregates_pt), 
+                           function(i) cor.test(patient_value_aggregates_pt[,i],patient_value_aggregates_met[,i],method = "pearson")$p.value)
+
+p_val_adjusted <- p.adjust(same_anitgen_p_value, method = "BH")
+same_anitgen_p_val <- data.frame(p_val_adjusted)
+same_anitgen_p_val$antigen <- gsub("PT_", "", colnames(patient_value_aggregates_pt))
+
+#Add adjusted p values to the final plot
+same_anitgen_p_val
+
+aggregate_value_table$Site.of.Metastasis <- immune_pheno$Site.of.metastasis[match(aggregate_value_table$Patient.ID, immune_pheno$Patient.ID)]
+
+p <-ggscatter(aggregate_value_table, x = "PT_HLA-ABC", y = "met_HLA-ABC", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = FALSE, 
+           cor.coef = FALSE, cor.method = "pearson",
+           xlab = "Primary HLA-ABC", ylab = "Met HLA-ABC")
+
+p1<- ggscatter(aggregate_value_table, x = "PT_HH3", y = "met_HH3", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary HH3", ylab = "Met HH3")
+
+
+p2 <- ggscatter(aggregate_value_table, x = "PT_SMA", y = "met_SMA",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary SMA", ylab = "Met SMA")
+
+p3 <- ggscatter(aggregate_value_table, x = "PT_panCK", y = "met_panCK",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary panCK", ylab = "Met panCK")
+
+
+p5 <- ggscatter(aggregate_value_table, x = "PT_Vimentin", y = "met_Vimentin",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary Vimentin", ylab = "Met Vimentin")
+
+p6 <- ggscatter(aggregate_value_table, x = "PT_CK8_18_19", y = "met_CK8_18_19", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CK8_18_19", ylab = "Met CK8_18_19")
+
+p7 <- ggscatter(aggregate_value_table, x = "PT_ER", y = "met_ER",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary ER", ylab = "Met ER")
+
+p8 <- ggscatter(aggregate_value_table, x = "PT_CK14", y = "met_CK14", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CK14", ylab = "Met CK14")
+
+p9 <- ggscatter(aggregate_value_table, x = "PT_p53", y = "met_p53",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary p53", ylab = "Metastasis p53")
+
+p10 <- ggscatter(aggregate_value_table, x = "PT_GLUT1", y = "met_GLUT1", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary GLUT1", ylab = "Met GLUT1")
+
+p11 <- ggscatter(aggregate_value_table, x = "PT_Bcl-2", y = "met_Bcl-2",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary Bcl-2", ylab = "Metastasis Bcl-2")
+
+p12 <- ggscatter(aggregate_value_table, x = "PT_HER2", y = "met_HER2",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary HER2", ylab = "Met HER2")
+
+p13 <- ggscatter(aggregate_value_table, x = "PT_CK5", y = "met_CK5",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CK5", ylab = "Met CK5")
+
+p14 <- ggscatter(aggregate_value_table, x = "PT_CD274", y = "met_CD274",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CD274", ylab = "Met CD274")
+
+p15 <- ggscatter(aggregate_value_table, x = "PT_AR", y = "met_AR",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary AR", ylab = "Met AR")
+
+p16 <- ggscatter(aggregate_value_table, x = "PT_GATA3", y = "met_GATA3",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary GATA3", ylab = "Met GATA3")
+
+p17 <- ggscatter(aggregate_value_table, x = "PT_CK7", y = "met_CK7",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CK7", ylab = "Metastasis CK7")
+
+p18 <- ggscatter(aggregate_value_table, x = "PT_CAIX", y = "met_CAIX",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary CAIX", ylab = "Met CAIX")
+
+p19 <- ggscatter(aggregate_value_table, x = "PT_Fibronectin", y = "met_Fibronectin",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary Fibronectin", ylab = "Met Fibronectin")
+
+p20 <- ggscatter(aggregate_value_table, x = "PT_Ki-67_Er168", y = "met_Ki-67_Er168",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary Ki-67_Er168", ylab = "Met Ki-67_Er168")
+
+p21 <- ggscatter(aggregate_value_table, x = "PT_EGFR", y = "met_EGFR",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary EGFR", ylab = "Met EGFR")
+
+p22 <- ggscatter(aggregate_value_table, x = "PT_p-S6", y = "met_p-S6", color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary p-S6", ylab = "Met p-S6")
+
+p23 <- ggscatter(aggregate_value_table, x = "PT_cleaved_CP", y = "met_cleaved_CP",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary cleaved_CP", ylab = "Met cleaved_CP")
+
+p24 <- ggscatter(aggregate_value_table, x = "PT_mTOR", y = "met_mTOR",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary mTOR", ylab = "Met mTOR")
+
+p25 <- ggscatter(aggregate_value_table, x = "PT_E/P-Cadherin", y = "met_E/P-Cadherin",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary E/P-Cadherin", ylab = "Met E/P-Cadherin")
+
+p26 <- ggscatter(aggregate_value_table, x = "PT_p-Rb", y = "met_p-Rb",color = "Site.of.Metastasis", palette = c("#00AFBB", "#E7B800", "#FC4E07", "gray", "magenta"),
+           add = "reg.line",add.params = list(color="black", fill= "lightgray") ,conf.int = TRUE, 
+           cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Primary p-Rb", ylab = "Met p-Rb")
+
+
+
+ggarrange(p,p1, p2,p3,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,p16,p17,p18,p19,p20,p21,p22,p23,p24,p25,p26, ncol = 6, nrow = 5)
+
+```
+
+
+
+
+### Evaluate Ki67 expression as number of positive cells
+
+```{r ki67-high-cell-expression-gaussian-mixture-model}
+library(mclust)
+
+markers_include <- c("Ki-67_Er168")
+
+cluster_counts_normalized <- subset(assay(sce, "normalized"), rownames(assay(sce, "normalized")) %in% markers_include)
+fit = Mclust(cluster_counts_normalized, G=2, model="V")
+
+summary(fit)
+table(fit$classification)
+
+sce$Ki67_clusters <- 0
+sce$Ki67_clusters <- as.factor(fit$classification)
+sce$Ki67_clusters <- as.factor(sce$Ki67_clusters)
+
+sce$cluster_id <- sce$Ki67_clusters 
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+plotClusterExprs(sce, k = "custom", features = c("Ki-67_Er168"))
+
+sce$condition <- sce$sample_type
+plotPbExprs(sce,assay= 'normalized', k = "custom", features = c("Ki-67_Er168"),group_by = "cluster_id", color_by = "condition", ncol = 1,fun= "mean")
+```
+
+```{r ki67-high-cell-proportions-paired-pt-met}
+### Plot paired abundances
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),2)
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),2)
+
+c=2
+x <- data.frame(abundances_per_patient_PT[c,])
+x["Patient.ID"] <- rownames(x)
+names(x)[1] <- "proportion_pt"
+y <- data.frame(abundances_per_patient_met[c,])
+y["Patient.ID"] <- rownames(y)
+names(y)[1] <- "proportion_met"
+merged_tbl <- merge(x,y)
+
+df_paired <- reshape2::melt(merged_tbl, id = "Patient.ID")
+colnames(df_paired)[2] <- "Sample type"
+colnames(df_paired)[3] <- "Proportion"
+
+ggpaired(df_paired, x = "Sample type", y = "Proportion",
+         color = "Sample type", line.color = "gray", line.size = 0.4,
+         palette = "jco")+ stat_compare_means(paired = TRUE)+ geom_jitter(color="black", size=1.5, alpha=0.6, width = 0.05, height=0.00)+
+  scale_y_continuous(breaks =seq(0, 1, by = 0.1),limits = c(0, 1), oob = scales::squish)+
+  xlab("Ki67 +ve cells in all samples") + ylab("Proportion")+ theme(legend.title = element_blank())
+
+
+```
+
+
+
+
+### Evaluate p-Rb expression as number of positive cells
+
+```{r p-Rb-high-cell-expression-gaussian-mixture-model}
+markers_include <- c("p-Rb")
+
+cluster_counts_normalized <- subset(assay(sce, "normalized"), rownames(assay(sce, "normalized")) %in% markers_include)
+fit = Mclust(cluster_counts_normalized, G=2, model="V")
+
+summary(fit)
+table(fit$classification)
+
+sce$Ki67_clusters <- 0
+sce$Ki67_clusters <- as.factor(fit$classification)
+sce$Ki67_clusters <- as.factor(sce$Ki67_clusters)
+
+sce$cluster_id <- sce$Ki67_clusters 
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+plotClusterExprs(sce, k = "custom", features = c("p-Rb"))
+
+sce$condition <- sce$sample_type
+plotPbExprs(sce,assay= 'normalized', k = "custom", features = c("p-Rb"),group_by = "cluster_id", color_by = "condition", ncol = 1,fun= "mean")
+```
+
+```{r pRb-high-cell-proportions-paired-pt-met}
+### Plot paired abundances
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+fq_per_patient_pt <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(fq_per_patient_pt,2,function(x){x/sum(x)}),2)
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+fq_per_patient_met <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_met <- round(apply(fq_per_patient_met,2,function(x){x/sum(x)}),2)
+
+c=2
+x <- data.frame(abundances_per_patient_PT[c,])
+x["Patient.ID"] <- rownames(x)
+names(x)[1] <- "proportion_pt"
+y <- data.frame(abundances_per_patient_met[c,])
+y["Patient.ID"] <- rownames(y)
+names(y)[1] <- "proportion_met"
+merged_tbl <- merge(x,y)
+
+df_paired <- reshape2::melt(merged_tbl, id = "Patient.ID")
+colnames(df_paired)[2] <- "Sample type"
+colnames(df_paired)[3] <- "Proportion"
+
+ggpaired(df_paired, x = "Sample type", y = "Proportion",
+         color = "Sample type", line.color = "gray", line.size = 0.4,
+         palette = "jco")+ stat_compare_means(paired = TRUE)+ geom_jitter(color="black", size=1.5, alpha=0.6, width = 0.05, height=0.00)+
+  scale_y_continuous(breaks =seq(0, 1, by = 0.1),limits = c(0, 1), oob = scales::squish)+
+  xlab("pRb +ve cells in all samples") + ylab("Proportion")+ theme(legend.title = element_blank())
+
+
+```
+
+
+
+### Check marker positive cels on non epithelial cells
+
+
+```{r cell-class-markers-of-interest-expression}
+
+# for plotting purposes change the allocation of state and type markers
+#CATALYST packages plots state and type markers separately
+clustering_markers <- c("GLUT1","Bcl-2" ,"HER2", "CK5" ,"Ki-67_Er168","p-S6","E/P-Cadherin","p-Rb")
+
+all_markers <- rownames(rowData(sce))
+clustering_cols <- match(clustering_markers,all_markers)
+marker_class <- rep("type", length(rownames(rowData(sce))))
+marker_class[clustering_cols] <- "state"
+marker_class <- factor(marker_class, levels = c("type", "state"))
+rowData(sce)$marker_class <- marker_class
+
+sce$condition <- factor(sce$cell_class)
+sce$sample_id <- factor(paste(sce$sample_id, sce$cell_class)) 
+plotPbExprs(sce, facet_by = "antigen", ncol = 5)
+

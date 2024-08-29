@@ -1,0 +1,392 @@
+---
+title: "MyeloidPanel_spatial"
+author: "SandraTietscher"
+date: "2021-11-05"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+This script looks at the spatial distribution of different myeloid cell phenotypes.
+
+
+# Load libraries and data
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(dittoSeq)
+library(cowplot)
+library(scran)
+library(edgeR)
+library(CATALYST)
+library(cytomapper)
+library(vegan)
+library(pairwiseAdonis)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(ggrepel)
+
+# Read SingleCellExperiment object with subcluster myeloid cells
+sce <- readRDS("output/SCEs/myeloid/myeloidSCE_M.rds")
+```
+
+# Compare phenotype proportions in intratumoral, stromal-enriched and margin regions of PT
+
+```{r prepare-SCE-PT}
+sce_PT <- filterSCE(sce, Tissue.Type == "PT")
+sce_PT$patientLocation <- paste(sce_PT$Patient.ID, sce_PT$Location, sep = "_")
+```
+
+Use CATALYST's clrDR function to compute centered log-ratios on cluster proportions and visualize them in a lower-dimensional space (PCA).
+
+```{r catalyst-clrDR-samples}
+sce_PT$sample_id <- factor(sce_PT$patientLocation)
+sce_PT$cluster_id <- sce_PT$M_cluster
+sce_PT$condition <- factor(sce_PT$Location)
+metadata(sce_PT)$cluster_codes <- data.frame(M_cluster = factor(sce_PT$M_cluster))
+
+clrDR(sce_PT, dr = "PCA", by = "sample_id", k = "M_cluster", point_pal = metadata(sce)$colour_vectors$Location)
+```
+
+Permanova (Permutational Multivariate Analysis of Variance) on distance matrices to test whether the myeloid phenotypic composition differs significantly across different locations.
+
+```{r permanova-location}
+
+# Calculate Aitchisons distance (Euclidean distance on centered-log ratio)
+patientLocation_tbl <- prop.table(table(sce_PT$patientLocation, sce_PT$cluster_id) + 0.00001, margin = 1)
+patientLocation_clr <- compositions::clr(patientLocation_tbl)
+dist <- vegdist(patientLocation_clr, method = "euclidean")
+
+metadata <- data.frame(patient = sapply(strsplit(rownames(patientLocation_tbl), "_"), "[[", 1),
+                       location = sapply(strsplit(rownames(patientLocation_tbl), "_"), "[[", 2))
+
+# Check if dispersions between groups are different
+mod_location <- betadisper(dist, metadata$location, type = "median", bias.adjust = FALSE,
+       sqrt.dist = FALSE, add = FALSE)
+permutest(mod_location, pairwise = TRUE, permutations = 999)
+
+# Permanova test (overall and pairwise)
+adonis(dist ~location,  data=metadata, permutations=9999)
+pairwise.adonis(dist,metadata$location,p.adjust.m= 'BH')
+```
+
+Differential abundance by location (reference: margin regions)
+
+```{r DA-location}
+abundances <- table(sce_PT$M_cluster, sce_PT$patientLocation) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "margin" is the baseline group
+meta <- colData(sce_PT)[match(colnames(abundances), sce_PT$patientLocation),]
+location <- factor(meta$Location)
+meta$location <- relevel(x=location, ref = "margin")
+y.ab <- DGEList(abundances, samples=meta, group = meta$location)
+design <- model.matrix(~Patient.ID + location, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Plot
+
+## Stromal vs margin
+  res <- glmQLFTest(fit.ab, coef="locationstromal")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 20)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort by logFC
+  order <- rownames(DA[order(DA$logFC),])
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Stromal vs margin"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+## Intratumoral vs margin
+res <- glmQLFTest(fit.ab, coef="locationintratumoral")
+  summary(decideTests(res))
+  DA <- topTags(res, n = 20)$table
+  DA$celltype <- rownames(DA)
+  DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+  
+  # Sort same as above
+  DA <- DA[order,]
+  DA$celltype <- factor(DA$celltype, levels = DA$celltype)
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0("logFC: Intratumoral vs margin"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+# Compare phenotype proportions in samples that are clinically classified as "hot" vs "cold"
+
+```{r read-patho}
+# Load csv with pathologist-annotated immune phenotype information
+patho <- read.csv("data/immune_phenotypes_pathology_encoded.csv")
+```
+
+For PTs only - differential abundance testing using EdgeR.
+
+```{r DA-hotcold-PT}
+sce_PT$infiltration <- patho$Immune.phenotype.PT[match(sce_PT$Patient.ID, patho$Patient.ID)]
+
+# Differential abundance testing
+abundances <- table(sce_PT$cluster_id, sce_PT$Patient.ID) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "inflamed" is the baseline group
+meta <- colData(sce_PT)[match(colnames(abundances), sce_PT$Patient.ID),]
+infiltration <- factor(meta$infiltration)
+meta$infiltration <- relevel(x=infiltration, ref = "inflamed")
+y.ab <- DGEList(abundances, samples=meta, group = meta$infiltration)
+design <- model.matrix(~infiltration, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance
+res <- glmQLFTest(fit.ab)
+summary(decideTests(res))
+DA <- topTags(res, n= nrow(abundances))$table
+DA$subtype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+DA <- DA[order(DA$logFC),]
+DA$subtype <- factor(DA$subtype, levels = DA$subtype)
+
+# Plot
+ggplot(DA, aes(subtype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y="Excluded vs inflamed", x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+For PTs and Met together - differential abundance testing using EdgeR.
+
+```{r DA-hotcold-all}
+sce$patient.site <- paste(sce$Patient.ID, ifelse(sce$Tissue.Type == "PT", "PT", "Met"), sep = "_")
+
+# Clean up pathology table
+patho1 <- patho[patho$Patient.ID != "ID17",] # Exclude the one patient whose metastatic sites have different annotations
+patho_short <- patho1[,c(1,3,4)]
+colnames(patho_short) <- c("Patient.ID", "PT", "Met")
+patho_short <- pivot_longer(patho_short, 2:3, names_to = "site", values_to = "infiltration")
+patho_short$patient.site <- paste(patho_short$Patient.ID, patho_short$site, sep = "_")
+
+# Exclude patients not present in the pathology list
+sce <- sce[,which(sce$Patient.ID %in% patho1$Patient.ID)]
+sce$infiltration <- patho_short$infiltration[match(sce$patient.site, patho_short$patient.site)]
+
+# Covert to binary characteristic (hot/cold)
+sce$infiltration <- ifelse(sce$infiltration == "inflamed", "hot", "cold")
+
+# Differential abundance testing
+abundances <- table(sce$M_cluster, sce$patient.site) 
+abundances <- unclass(abundances) 
+
+# Attach column metadata and relevel so that "hot" is the baseline group
+meta <- colData(sce)[match(colnames(abundances), sce$patient.site),]
+infiltration <- factor(meta$infiltration)
+meta$infiltration <- relevel(x=infiltration, ref = "hot")
+y.ab <- DGEList(abundances, samples=meta, group = meta$infiltration)
+design <- model.matrix(~infiltration, data = y.ab$samples)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance
+res <- glmQLFTest(fit.ab)
+summary(decideTests(res))
+DA <- topTags(res, n= nrow(abundances))$table
+DA$subtype <- rownames(DA)
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+DA <- DA[order(DA$logFC),]
+DA$subtype <- factor(DA$subtype, levels = DA$subtype)
+
+# Plot
+ggplot(DA, aes(subtype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y="cold vs hot", x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+```
+
+# Analyse spatial distribution of myeloid phenotypes in relation to tumor/stroma border
+
+```{r border-distance-prep}
+# Read in file with tumor/stroma mask information
+tsmask <- read.csv("data/final_distanceTumorStroma_Cells_myeloid.csv")
+
+# Read in file for bone images (was trained separately due to bad training quality)
+tsmask_bone <- read.csv("data/myeloid_distanceTumorStroma_BONE_only_Cells.csv")
+```
+
+### Merge information about tumor/stroma border distance into main object
+
+In some images, all cells have the value 65535 (max uint16 value). These are images where no tumor/stroma edge was identified, so no distances could be calculated. Exclude these for all mask-based analysis.
+
+```{r merge-into-sce}
+tsmask$ImageObjectNr <- paste(tsmask$ImageNumber, tsmask$ObjectNumber, sep="_")
+
+# Match Object Number (via file name)
+tsmask_bone$file <- paste0(tsmask_bone$Metadata_acname, "_a", tsmask_bone$Metadata_acid, "_ac_full.tiff")
+tsmask_bone$ImageNumber <- sce$ImageNumber[match(tsmask_bone$file, sce$file)]
+tsmask_bone$ImageObjectNr <- paste(tsmask_bone$ImageNumber, tsmask_bone$ObjectNumber, sep="_")
+sce$ImageObjectNr <- paste(sce$ImageNumber, sce$CellNumber, sep="_")
+
+# remove bone image cells from tsmask object
+bone_img <- tsmask_bone$ImageObjectNr
+tsmask <- filter(tsmask, !(ImageObjectNr %in% bone_img))
+
+col_keep <- c("ImageObjectNr", "Intensity_MeanIntensity_TumourMask_Distance_B100", "Intensity_MinIntensityEdge_TumourMask_Distance_B100", "Intensity_MaxIntensityEdge_TumourMask_Distance_B100")
+tsmask <- rbind(tsmask[,col_keep], tsmask_bone[,col_keep])
+
+
+# Add mean, minimum and maximum border distances to object
+sce$meanBorderDistance <- tsmask$Intensity_MeanIntensity_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+sce$minBorderDistance <- tsmask$Intensity_MinIntensityEdge_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+sce$maxBorderDistance <- tsmask$Intensity_MaxIntensityEdge_TumourMask_Distance_B100[match(sce$ImageObjectNr, tsmask$ImageObjectNr)]
+
+# Set 65535 to NA
+sce$meanBorderDistance <- ifelse(sce$meanBorderDistance == 65535, NA, sce$meanBorderDistance)
+sce$minBorderDistance <- ifelse(sce$minBorderDistance == 65535, NA, sce$minBorderDistance)
+sce$maxBorderDistance <- ifelse(sce$maxBorderDistance == 65535, NA, sce$maxBorderDistance)
+
+# Assign binary mask status
+sce$mask_bin <- ifelse(sce$meanBorderDistance > 0, "tumor", "stroma")
+
+# Assign mask status where cells whose meanDistance is negative (outside tumor mask) but whose maxDistance is positive (inside tumor mask) are classified as "edge"
+sce$mask <- ifelse(sce$meanBorderDistance > 0, "tumor", ifelse(sce$maxBorderDistance > 0, "edge", "stroma"))
+
+# Subset cells (images) with no NAs
+sce_sub <- sce[,which(!(is.na(sce$meanBorderDistance)))]
+```
+
+### Compare proportions of myeloid cells that are within a tumor mask in PT vs met
+Intratumoral only!
+
+```{r proportions-tumor-stroma}
+sce_sub$patient_tissue <- paste(sce_sub$Patient.ID, sce_sub$Tissue.Type, sep = "_")
+
+# Subset intratumoral
+sce_intra <- sce_sub[,which(sce_sub$Location == "intratumoral")]
+M_table <- as.data.frame(prop.table(table(sce_intra$patient_tissue, sce_intra$mask), margin = 1))
+M_table <- separate(M_table, Var1, into = c("patient", "tissue"))
+
+## Plot percentage that is within tumor mask
+M_mask <- filter(M_table, Var2 == "tumor")
+my_comparisons <- list( c("Brain", "PT"), c("Bone", "PT"), c("Liver", "PT"), c("SoftTissue", "PT"))
+ggplot(M_mask, aes(tissue, Freq))+
+  geom_boxplot()+
+  ylab("Percentage of myeloid cells in tumor mask")+
+  stat_compare_means(method = "anova")+
+  stat_compare_means(comparisons = my_comparisons)
+```
+
+### Enrichment of myeloid cell subtypes within tumor vs stromal masks
+
+Edge regions are classified as tumor regions for this analysis.
+
+```{r Tcell-subtype-enrichment}
+# Everything that is on the edge --> count into tumor mask
+sce_sub$mask <- ifelse(sce_sub$mask == "stroma", "stroma", "tumor")
+
+abundances <- table(sce_sub$M_cluster, sce_sub$mask)
+logEnrichment_tumor <- as.data.frame(log2(abundances[,"tumor"]/abundances[,"stroma"]))
+colnames(logEnrichment_tumor) <- "logEnrichment"
+logEnrichment_tumor$M_cluster <- rownames(logEnrichment_tumor)
+
+#colors
+M_col <- c("#CC99FF", "#7F00FF", "#CC00CC", "#FF66FF", "#CC0066", "#9A6767", "#990000", 
+           "#B30303", "#F03C3C", "#FF9999", "#FFB266", "#FF8000", "#CC6600", "#E6A73A",
+           "#FFAE33", "#D2BD50", "#F6E176", "#F9D20E", "#FFEA33", "#D7FF33")
+names(M_col) <- colnames(logEnrichment_tumor)
+
+pos <- position_jitter(width = 0, height = 0.1, seed = 2)
+ggplot(logEnrichment_tumor, aes(logEnrichment, "y")) +
+  geom_jitter(aes(fill = M_cluster), position = pos, shape = 21, size = 3)+
+  scale_fill_manual(values = M_col)+
+  geom_label_repel(aes(label=M_cluster), size = 3, position = pos)+
+  theme(axis.title.y= element_blank(), axis.text.y = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=1), panel.background = element_blank())+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  xlab("Fold-enrichment in tumor mask [log2]")
+
+```
+
+### Correlation of marker expression with border distance
+
+```{r marker-distance-curve}
+# Re-scale arcsinh-transformed expression values (only over myeloid cells)
+# assay(sce_sub, "scaled") <- t(scale(t(assay(sce_sub, "exprs"))))
+# 
+# markers_include <- c("CD38", "HLA-DR", "CLEC9A", "CD68", "CD163", "CD11b", "CD204", "CD11c", "CD1c", "CD16", "MMP9", "CD274", "STING", "IDO", "CD33", "Arginase-1", "CD209", "CD40", "CD4", "CD14", "CD206", "LAMP3", "MPO", "CD303", "GLUT1")
+# 
+# exprs <- t(assay(sce_sub, "scaled")[markers_include,])
+# coldata <- as.data.frame(colData(sce_sub))
+# coldata_ext <- cbind(coldata, exprs)
+# coldata_ext <- pivot_longer(coldata_ext, cols = all_of(markers_include), values_to = "exprs", names_to = "marker")
+# 
+# ggplot(coldata_ext, aes(x = exprs, y = meanBorderDistance))+
+#   #geom_point(color = "grey20", alpha = 0.1)+
+#   #stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE)+
+#   #scale_fill_distiller(palette=4, direction=1) +
+#   facet_wrap(~marker, scales = "free_x", ncol = 7)+
+#   coord_cartesian(ylim=c(-200, 50))+
+#   geom_hline(yintercept = 0, linetype = "dashed")+
+#   #stat_cor(method="spearman", label.x.npc = "middle", color = "black") + 
+#   geom_smooth(method = "gam", color = "red", se=TRUE)+ 
+#   xlab("Scaled arcsinh-transformed counts")+
+#   theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+#         panel.background = element_blank(),
+#         strip.background = element_blank())
+
+```
+
+```{r marker-distance-combined}
+# markers_sub <- c("CD68", "CD163", "CD204", "CD11c", "CD1c", "MMP9", "CD274", "STING", "CD209", "CD14", "CD206", "LAMP3", "Arginase-1")
+# 
+# ggplot(filter(coldata_ext, marker %in% markers_sub), aes(x = exprs, y = meanBorderDistance, color = marker))+
+#   coord_cartesian(ylim=c(-220, 50), xlim = c(-2,15))+
+#   geom_hline(yintercept = 0, linetype = "dashed")+
+#   geom_smooth(method = "loess", se=FALSE)+ 
+#   scale_color_discrete()+
+#   xlab("Scaled arcsinh-transformed counts")+
+#   theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+#         panel.background = element_blank())
+
+```
+
+
+
+

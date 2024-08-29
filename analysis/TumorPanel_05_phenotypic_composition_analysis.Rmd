@@ -1,0 +1,597 @@
+---
+title: "TumorPanel_05_phenotypic_composition_analysis"
+author: "LauraKuett"
+date: "2021-02-12"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+## Introduction
+
+This script analyzes tumor cell phenotypes for primary tumors and metastatic sites.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries and data
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(RColorBrewer)
+library(dittoSeq)
+library(scales)
+library(tidyverse)
+library(ggpubr)
+library(cowplot)
+library(scran)
+library(CATALYST)
+library(edgeR)
+library(compositions)
+library(vegan)
+library(ComplexHeatmap)
+
+#setwd("projects/BCmet/workflowr_publication/BCmet_pub")
+# Read SingleCellExperiment object
+sce_epithelial <- readRDS("output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+#sce_epithelial <- readRDS("/Volumes/projects/BCmet/workflowr_publication/BCmet_pub/output/SCEs/tumor/tumorSCE_epithelial_clustered.rds")
+
+
+markers_to_analyse<- c("HLA-ABC","HH3", "SMA","H3K27me3","panCK","Vimentin",
+                       "CK8_18_19","ER", "CK14","p53", "GLUT1","Bcl-2" ,
+                       "HER2", "CK5" ,"CD274","AR","GATA3","CK7", 
+                       "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP","DNA1")
+
+clustering_markers <- c("HLA-ABC","panCK","Vimentin","CK8_18_19",
+                     "ER", "CK14","p53", "GLUT1",
+                     "Bcl-2" ,"HER2", "CK5" ,"CD274", "AR","GATA3","CK7",
+                     "CAIX" ,"Fibronectin", "Ki-67_Er168","EGFR","p-S6",
+                     "mTOR","E/P-Cadherin","p-Rb","cleaved_CP")
+
+sce1 <- filterSCE(sce_epithelial, rownames(sce_epithelial) %in% markers_to_analyse)
+#filter only patients with matched samples
+sce2 <-filterSCE(sce1, matched_samples==1)
+#Check number of cells per patient sample:
+counts_per_sample <- table(sce2$sample_type, sce2$Patient.ID)
+samples_with_few_cells <- colSums(counts_per_sample<200)
+patient_to_exclude <- rownames(data.frame(samples_with_few_cells[samples_with_few_cells==1]))
+
+unique(sce2$Site.of.metastasis[sce2$Patient.ID %in% patient_to_exclude])
+
+sce <- filterSCE(sce2,!(sce2$Patient.ID %in% patient_to_exclude))
+#add immune phenotyping information
+immune_pheno <- read.csv("/Volumes/projects/BCmet/workflowr_publication/BCmet_pub/data/patient_metadata_encoded.csv")
+immune_pheno_name <- immune_pheno$immunePT_PT[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_PT <- factor(immune_pheno_name)
+immune_pheno_name1 <- immune_pheno$immunePT_Met[match(sce$Patient.ID, immune_pheno$Patient.ID)]
+sce$immunePT_Met <- factor(immune_pheno_name1)
+
+#Repeat tissue type as condition for plotting functions in CATALYST
+sce$cluster_id <-sce$flowSOM_big_clusters
+
+sce$Tissue.Type <- relevel(sce$Tissue.Type, "PT")
+sce$condition <- factor(sce$Tissue.Type)
+sce$Patient.ID <- factor(sce$Patient.ID)
+sce$Location <- factor(sce$Location)
+sce$Age.delta <- as.numeric(sce$Age.delta)
+sce$agedeltaGroup[sce$Age.delta < 6] <- "AgeDelta<5"
+sce$agedeltaGroup[sce$Age.delta > 5] <- "AgeDelta>5"
+sce$agedeltaGroup <- factor(sce$agedeltaGroup)
+
+colSums(table(sce$Patient.ID,sce$Site.of.metastasis)!=0)
+colSums(table(sce$Patient.ID,sce$Tissue.Type)!=0)
+colSums(table(sce$Patient.ID,sce$molecular.subtype)!=0)
+```
+
+### Heatmap for phenotypic clusters
+
+```{r heatmap-median-expression-tumor-phenotypes-flowSOM, fig.width=15, fig.height=10}
+
+
+plotExprHeatmap(sce1, features = "type",by = "cluster_id", k = "custom",assay = "scaled",
+    scale = "last", q = 0.01, perc = TRUE,bars = TRUE, col_dend = FALSE,col_clust = TRUE,row_anno= FALSE, distance = "euclidean", linkage = "ward.D2")
+
+```
+
+### box plot for cluter abundances per patient, order to match the clusters on the heatmap
+
+```{r abundance-bar-plot}
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances_per_patient_met <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+
+dat_prop <- round(abundances_per_patient_PT*100,1)
+dat_prop[dat_prop==0] <- NA
+dat_prop <- as.data.frame.matrix(dat_prop)
+dat_prop$cluster_id <- factor(rownames(dat_prop), levels =c(11, 12,8,4,20,16,19,14,6,10,13,15,18,17,2,3,7,1,5,9))
+
+dat_prop <- dat_prop %>% arrange(dat_prop$cluster_id)
+dat_prop$cluster_id <- NULL
+boxplot(t(dat_prop),horizontal=T, border="gray32", col = "#0073C2FF",frame=F)
+
+
+dat_prop <- round(abundances_per_patient_met*100,1)
+dat_prop[dat_prop==0] <- NA
+dat_prop <- as.data.frame.matrix(dat_prop)
+dat_prop$cluster_id <- factor(rownames(dat_prop), levels =c(11, 12,8,4,20,16,19,14,6,10,13,15,18,17,2,3,7,1,5,9))
+
+dat_prop <- dat_prop %>% arrange(dat_prop$cluster_id)
+dat_prop$cluster_id <- NULL
+boxplot(t(dat_prop),horizontal=T, border="gray32", col = "#EFC000FF", frame=F)
+```
+
+
+### Plot frequency of clusters over all patients
+
+# Large tumor cell proportion overview: Hierachical barplots
+
+```{r proportion-barplots, fig.width= 25, fig.height=20}
+library(ComplexHeatmap)
+library(scales)
+
+sample_unique <-  immune_pheno
+rownames(sample_unique) <- sample_unique$Patient.ID
+
+
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0] <- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances_per_patient_met <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0] <- NA
+
+abundances_per_patient_PT_big_fs <- t(abundances_per_patient_PT)
+abundances_per_patient_met_big_fs <- t(abundances_per_patient_met)
+
+kpal_cl = c("#DC050C", "#B2DF8A","#8DD3C7","#A6761D","#E6AB02", "#7570B3", "#BEAED4", "#a30093", "#999796",
+    "#FB8072","#1965B0", "#7BAFDE", "#882E72","#B17BA6", "#FF7F00", "#FDB462", "#E7298A","#E78AC3","#33A02C","#55A1B1")
+names(kpal_cl) <- colnames(abundances_per_patient_met_big_fs)
+
+molSubtype_col <- c("#FC4E07","#E7B800","#00AFBB","gray")
+names(molSubtype_col) <- unique(sample_unique$molecular.subtype)
+
+ 
+colorsMet <- c("#CCCC00","#4C9900","#FF8000","#FF3333","#AC16AC") 
+names(colorsMet) <- c("Soft Tissue", "Multiple","Bone","Liver","Brain")
+
+cprops <- as.matrix(as.data.frame.matrix(abundances_per_patient_met_big_fs))
+
+ha.PT <- rowAnnotation(PrimaryTumor = anno_barplot(abundances_per_patient_PT_big_fs,  gp = gpar(fill = kpal_cl, col = NA), width = unit(10, "cm"), bar_width = 0.9, ylim = c(0,1)))
+
+
+ha.Met <- rowAnnotation(Metastasis = anno_barplot(abundances_per_patient_met_big_fs,  gp = gpar(fill = kpal_cl, col = NA), width = unit(10, "cm"), bar_width = 0.9, ylim = c(0,1)))
+
+
+ha2 <-   rowAnnotation(tissuetype = sample_unique[rownames(cprops),]$Site.of.metastasis, molecular_subtype = sample_unique[rownames(cprops),]$molecular.subtype, col = list(tissuetype = colorsMet, molecular_subtype = molSubtype_col))
+
+ha_legend <- list(Legend(labels= names(kpal_cl), legend_gp = gpar(fill = kpal_cl)))
+
+heatmap <- Heatmap(cprops) + ha.PT + ha.Met + ha2
+
+row_dend = as.dendrogram(hclust(dist(cprops)))
+row_dend = color_branches(row_dend, k = 14)
+
+ht_2 <- draw(heatmap, annotation_legend_list=ha_legend, cluster_rows = row_dend)
+order <- rownames(cprops)[row_order(ht_2)]
+
+```
+
+
+```{r flowSOM20-cluster-frequencies-all-samples, fig.width=25, fig.height=10}
+sce$condition <- factor(sce$sample_type)
+plotAbundances(sce, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+
+#change the naming for plotting purposes so that primary tumor would be in the first column
+sce$sample_type <- 0
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "xM"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "xM"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "xM"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "xM"
+sce$sample_type <- factor(sce$sample_type, c("PT", "xM"))
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type)) 
+
+
+sce$condition <- factor(sce$Site.of.metastasis)
+
+sce_filtered <- filterSCE(sce,Site.of.metastasis=="Bone")
+plotAbundances(sce_filtered, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+sce_filtered <- filterSCE(sce,Site.of.metastasis=="Brain")
+plotAbundances(sce_filtered, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+
+sce_filtered <- filterSCE(sce,Site.of.metastasis=="Liver")
+plotAbundances(sce_filtered, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+sce_filtered <- filterSCE(sce,Site.of.metastasis=="SoftTissue")
+plotAbundances(sce_filtered, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+sce_filtered <- filterSCE(sce,Site.of.metastasis=="Multiple")
+plotAbundances(sce_filtered, k = "custom", by = "sample_id", group_by = "condition",col_clust = FALSE)
+
+#change back
+sce$sample_type[sce$Tissue.Type == 'PT'] <- "PT"
+sce$sample_type[sce$Tissue.Type == 'Liver'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Bone'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'Brain'] <- "M"
+sce$sample_type[sce$Tissue.Type == 'SoftTissue'] <- "M"
+sce$sample_type <- factor(sce$sample_type)
+sce$sample_id <- factor(paste(sce$Patient.ID, sce$sample_type))
+```
+
+### PCA plot over cluter abundances for primary tumor and metastatic samples
+
+```{r pca-tumor-phenotypes}
+#big flowSOM clusters
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+sce$condition <- factor(sce$Tissue.Type)
+
+clrDR(sce, by = "sample_id", k = "custom",size_by = FALSE,point_pal= c("#4C9900","#FF8000","#AC16AC","#FF3333","#CCCC00"), arrows= TRUE)
+```
+
+
+### Find clusters that are present in both sites or unique to one site and calculate the proportion of these clusters in each patient sample
+
+```{r boxplot-proportion-of-shared-unique-clusters}
+
+sce$cluster_id <- sce$flowSOM_big_clusters
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances_per_patient_met <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),2)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),2)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+
+
+clusters_in_both <- abundances_per_patient_met>=0.01 & abundances_per_patient_PT>=0.01
+clusters_only_in_met <- abundances_per_patient_met>=0.01 & abundances_per_patient_PT ==0
+clusters_only_in_pt <- abundances_per_patient_met ==0 & abundances_per_patient_PT>=0.01
+
+sce$tissue_based_clusters <- 4 
+
+for(i in 1:ncol(clusters_in_both)){
+ patientID <- colnames(clusters_in_both)[i]
+ 
+ clstrs <-  data.frame(clusters_in_both[,i][clusters_in_both[,i] == TRUE])
+ clstrs <- rownames(clstrs)
+ new_id = paste(patientID , "M")
+ sce$tissue_based_clusters[sce$sample_id == new_id & sce$cluster_id %in% clstrs] <- "1" #Present in both - metastasis and pt
+ 
+ new_id = paste(patientID , "PT")
+ sce$tissue_based_clusters[sce$sample_id == new_id & sce$cluster_id %in% clstrs] <- "1" #Present in both - metastasis and pt
+ 
+ new_id = paste(patientID , "M")
+ 
+ clstrs <-  data.frame(clusters_only_in_met[,i][clusters_only_in_met[,i] == TRUE])
+ clstrs <- rownames(clstrs)
+ sce$tissue_based_clusters[sce$sample_id == new_id & sce$cluster_id %in% clstrs] <- "3" #only in metastasis
+ 
+ new_id = paste(patientID , "PT")
+ clstrs <-  data.frame(clusters_only_in_pt[,i][clusters_only_in_pt[,i] == TRUE])
+ clstrs <- rownames(clstrs)
+ sce$tissue_based_clusters[sce$sample_id == new_id & sce$cluster_id %in% clstrs] <- "2" #only in pt
+ 
+  }
+
+sce$tissue_based_clusters <- factor(sce$tissue_based_clusters)
+sce$cluster_id <- factor(sce$tissue_based_clusters)
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$tissue_based_clusters)), levels = levels(sce$tissue_based_clusters))
+
+sce$sample_type <- relevel(sce$sample_type, "PT")
+plotAbundances(sce, k = "custom", by = "cluster_id", group_by = "sample_type",shape_by = 'Site.of.metastasis')
+```
+
+
+### Read the file with previously calculated diversity indicies 
+```{r diversity-metadata}
+diversity_metadata <- read.csv("data/patient_metadata_final_big_flowSOM.csv")
+rownames(diversity_metadata) <- diversity_metadata$Patient.ID
+```
+
+### Do more diverse/heterogeneous tumors have more diverse/heterogeneous metastatic sites?
+
+```{r heterogeneity-pt-vs-met}
+
+diversity_metadata$shannon_pt <- diversity_metadata$shannon_pt
+diversity_metadata$shannon_met <- diversity_metadata$shannon_met
+
+sp <- ggscatter(diversity_metadata, x = "shannon_pt", y = "shannon_met",
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval 
+   )
+# Add correlation coefficient
+sp + stat_cor(method = "pearson", size =8) #, label.x = 3, label.y = 30)
+```
+
+
+### Differential abundance testing between Met and PT
+Model accounts for paired patient samples
+
+```{r DA-allClusters-PTvsMet-tumor-flowSOM20}
+sce$cluster_id <- sce$flowSOM_big_clusters
+
+i = "All Met "
+
+sce_filtered <- sce
+
+
+# Prepare abundance object
+abundances <- table(sce_filtered$cluster_id, sce_filtered$sample_id)
+abundances <- unclass(abundances) 
+
+
+# Attach column metadata (Relevel so that PT is the baseline group)
+meta <- colData(sce_filtered)[match(colnames(abundances), sce_filtered$sample_id),]
+rownames(meta) <- meta$sample_id
+sample_type <- factor(meta$sample_type)
+Tissue.Type <- factor(meta$Tissue.Type)
+
+meta$sample_type <- relevel(x=sample_type, ref = "PT")
+meta$Tissue.Type <- relevel(x=Tissue.Type, ref = "PT")
+
+
+y.ab <- DGEList(abundances, samples=meta,remove.zeros = TRUE,group = meta$sample_type)
+# Define the design matrix for the model: Add Patient ID to the model to account for matched design, add tissue type as an additive factor
+design <- model.matrix(~Patient.ID + sample_type, data = y.ab$samples)
+
+
+# Calculate Normalization Factors to adjust for composition effect (this assumes that most cell type populations stay constant, which is not necessarily true)
+#y.ab <- calcNormFactors(y.ab)
+
+# Estimate NB and QL dispersion
+y.ab <- estimateDisp(y.ab, design, trend="none")
+summary(y.ab$common.dispersion)
+fit.ab <- glmQLFit(y.ab, design, robust=TRUE, abundance.trend=FALSE)
+summary(fit.ab$var.prior)
+
+# Test for differential abundance of cell types in PT vs met tissue and plot
+res <- glmQLFTest(fit.ab, coef=ncol(fit.ab))
+summary(decideTests(res))
+DA <- topTags(res, n = nrow(abundances))$table
+DA$celltype <- rownames(DA)
+DA$celltype <- factor(DA$celltype, levels = c('11','12','8','4','20','16','19','14','6','10','13','15','18','17','2','3','7','1','5','9'))
+DA$sign <- ifelse(DA$FDR<0.05, "yes", "no")
+
+ggplot(DA, aes(celltype, y = logFC))+
+  geom_col(aes(fill=sign))+
+  scale_fill_manual(values = c("grey", "darkgreen"))+
+  labs(y=paste0(i, "vs PT"), x="Cell type")+
+  coord_flip()+
+  labs(fill="Significant (FDR<0.05)")+
+  theme(panel.background=element_blank(), panel.border = element_rect(colour = "black", fill=NA, size=1))
+
+```
+
+
+# Bar plot of abundances for each cluster
+```{r barplot-proportion-of-all-clusters-PT-vs-Met, fig.width=15, fig.height=10}
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+plotAbundances(sce, k = "custom", by = "sample_id", group_by = "sample_type")
+```
+
+
+
+
+### calculate abundances for each clustering type again
+
+```{r abundance-for-each-clustering}
+###1*
+sce$cluster_id <- sce$flowSOM_big_clusters
+metadata(sce)$cluster_codes <- data.frame(custom = factor(levels(sce$cluster_id)), levels = levels(sce$cluster_id))
+
+sce_filtered <- filterSCE(sce,Tissue.Type=="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID) 
+abundances_per_patient_PT <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_PT[,colSums(abundances_per_patient_PT, na.rm = TRUE) == 0]<- NA
+
+
+sce_filtered <- filterSCE(sce,Tissue.Type!="PT")
+abundances_per_patient <- table(sce_filtered$cluster_id, sce_filtered$Patient.ID)
+abundances_per_patient_met <- round(apply(abundances_per_patient,2,function(x){x/sum(x)}),5)
+abundances_per_patient_met[,colSums(abundances_per_patient_met, na.rm = TRUE) == 0]<- NA
+
+abundances_per_patient_PT_big_fs <- abundances_per_patient_PT
+abundances_per_patient_met_big_fs <- abundances_per_patient_met
+
+```
+
+
+
+# Analyse major clusters in metastasis
+
+```{r boxplot-major-clusters-in-metastatic-sites}
+
+abundances_per_patient_met_km_major <- abundances_per_patient_met_big_fs
+abundances_per_patient_met_km_major[abundances_per_patient_met_km_major<=0.10] <- 0
+
+tots <- colSums(abundances_per_patient_met_km_major)
+boxplot(tots,main="Proportion of major clusters in metastasis", xlab="flowSOM clustering", ylab="Proportion",ylim = c(0, 1))
+stripchart(tots, vertical = TRUE, method = "jitter", add = TRUE, pch = 20, col = 'navy')
+```
+
+```{r histogram-major-clusters-in-metastatic-sites}
+counts <- colSums(abundances_per_patient_met_km_major != 0)
+hist(counts, main="flowSOM clustering", xlab="Number of major clusters", ylab="Number of patients")
+```
+
+
+```{r barplot--nr-patients-major-clusters-metastasis}
+common_clusters <- data.frame(rowSums(abundances_per_patient_met_km_major != 0))
+common_clusters$cluster_id <- rownames(common_clusters)
+colnames(common_clusters)[1] <- "Patient_count"
+
+p<-ggplot(common_clusters, aes(reorder(cluster_id, Patient_count),Patient_count)) +
+  geom_bar(stat="identity")+ ylab("Number of patients") + 
+    xlab("flowSOM cluster id") +
+    scale_y_continuous(limits = c(0,30)) 
+
+# Horizontal bar plot
+p + coord_flip()
+```
+
+
+```{r proportions-major-metastatic-clusters-in-primary-tumor}
+### What proportion the metastatic major clusters make up in the primary tumor
+tots_pt <- abundances_per_patient_PT_big_fs
+tots_pt[abundances_per_patient_met_km_major==0] <- 0
+
+counts_pt <- data.frame(colSums(tots_pt))
+counts_pt$Patient.ID <- rownames(counts_pt)
+colnames(counts_pt)[1] <-c( "Proportion_PT")
+
+counts_met <- data.frame(tots)
+
+counts_met$Patient.ID <- rownames(counts_met)
+colnames(counts_met)[1] <-c( "Proportion_Met")
+
+df_paired <-merge(counts_pt,counts_met)
+df_paired <- reshape2::melt(df_paired, id = "Patient.ID")
+
+ggpaired(df_paired, x = "variable", y = "value",
+         color = "variable", line.color = "gray", line.size = 0.4,
+         palette = "jco")+stat_compare_means(paired = TRUE)
+
+```
+
+
+### What % of the total epithelial cells represents the most common cluster in each patient
+
+```{r flowsom20-abundance-of-most-abundant-cluster}
+
+### flowsom big
+x = abundances_per_patient_PT_big_fs
+max_v <- data.frame(colMaxs(x))
+max_v$Patient.ID <- colnames(x)
+
+cluster_v <- data.frame(apply( x, 2, which.max))
+cluster_v$Patient.ID <- rownames(cluster_v)
+
+most_abundant <- merge(max_v, cluster_v)
+colnames(most_abundant)<- c("Patient.ID", "Abundance_PT", "Cluster_PT")
+most_abundant_pt_fs <- most_abundant
+
+
+x = abundances_per_patient_met_big_fs
+max_v <- data.frame(colMaxs(x))
+max_v$Patient.ID <- colnames(x)
+
+cluster_v <- data.frame(apply( x, 2, which.max))
+cluster_v$Patient.ID <- rownames(cluster_v)
+
+most_abundant <- merge(max_v, cluster_v)
+colnames(most_abundant)<- c("Patient.ID", "Abundance_Met", "Cluster_Met")
+most_abundant_met_fs <- most_abundant
+
+most_abundant_fs_big <- merge(most_abundant_pt_fs,most_abundant_met_fs)
+most_abundant_fs_big_no_clust <- most_abundant_fs_big[,-c(3,5)]
+
+most_abundant_all <- reshape2::melt(most_abundant_fs_big_no_clust, id = "Patient.ID")
+
+
+most_abundant_all %>% ggplot( aes(x=variable, y=value)) +
+    geom_boxplot(outlier.shape = NA) + scale_y_continuous(breaks = round(seq(min(most_abundant_all$value), max(most_abundant_all$value), by = 0.05),1))+
+    geom_jitter(color="red", size=1.5, alpha=0.6, width = 0.05, height=0.05) +
+    theme_classic() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=12),text = element_text(size=14)
+    ) +
+    ggtitle("Abundance of the most abundant cluster") +
+    xlab("") + ylab("Proportion")
+```
+
+# Flow diagram showing the most abundant cluster in primary tumor vs metastatic site for each paired patient sample
+```{r flowchart-most-abundant-flowSOM20, , fig.width=5, fig.height=10}
+library(ggalluvial)
+
+### flowsom big
+x = abundances_per_patient_PT_big_fs
+max_v <- data.frame(colMaxs(x))
+max_v$Patient.ID <- colnames(x)
+
+cluster_v <- data.frame(apply( x, 2, which.max))
+cluster_v$Patient.ID <- rownames(cluster_v)
+
+most_abundant <- merge(max_v, cluster_v)
+colnames(most_abundant)<- c("Patient.ID", "Abundance_PT", "Cluster_PT")
+most_abundant_pt_fs <- most_abundant
+
+
+x = abundances_per_patient_met_big_fs
+max_v <- data.frame(colMaxs(x))
+max_v$Patient.ID <- colnames(x)
+
+cluster_v <- data.frame(apply( x, 2, which.max))
+cluster_v$Patient.ID <- rownames(cluster_v)
+
+most_abundant <- merge(max_v, cluster_v)
+colnames(most_abundant)<- c("Patient.ID", "Abundance_Met", "Cluster_Met")
+most_abundant_met_fs <- most_abundant
+
+most_abundant_fs_big <- merge(most_abundant_pt_fs,most_abundant_met_fs)
+
+
+most_abundant_fs_big$links <- paste(most_abundant_fs_big$Cluster_PT, most_abundant_fs_big$Cluster_Met, sep = "_")
+links <- as.data.frame(table(most_abundant_fs_big$links))
+links <- separate(links, 1, into = c("PT", "Met"), sep = "_" )
+links$subject <- c(1:51)
+
+patho2 <- pivot_longer(links, 1:2, names_to = "Cluster", values_to = "type")
+patho2$Cluster <- factor(patho2$Cluster, level = c("PT", "Met"))
+
+kpal =  c(
+    "#DC050C", "#1965B0", "#7BAFDE",
+    "#B17BA6", "#FF7F00", "#FDB462", "#E7298A", "#E78AC3",
+    "#33A02C", "#B2DF8A", "#55A1B1", "#8DD3C7", "#A6761D",
+    "#E6AB02", "#7570B3", "#BEAED4", "#666666", "#999999",
+    "#aa8282", "#d4b7b7", "#8600bf", "#ba5ce3", "#808000",
+    "#aeae5c", "#1e90ff", "#00bfff", "#56ff0d", "#ffff00")
+
+ggplot(patho2,
+       aes(x = Cluster, stratum = type, alluvium = subject, y = Freq, fill = type, label = type)) +
+  scale_x_discrete(expand = c(.1, .1)) +
+  scale_fill_manual(values =kpal)+
+  geom_flow(alpha = 1) +
+  geom_stratum(alpha = 1) +
+  geom_text(stat = "stratum", size = 3) +
+  theme(legend.position = "none", panel.background=element_blank())
+
+```
+
+
+
+
+

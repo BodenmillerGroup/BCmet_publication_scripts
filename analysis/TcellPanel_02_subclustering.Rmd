@@ -1,0 +1,280 @@
+---
+title: "TcellPanel_subclustering"
+author: "SandraTietscher"
+date: "2021-11-02"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+This script performs separate subclustering of CD4+ and CD8+ T cells based on T cell subtype and cell state markers.
+
+
+# Load libraries and data
+
+First, we will load the needed libraries and the `SingleCellExperiment` object, that was created in the previous section.
+
+```{r read-libraries-and-data, message=FALSE, results="hide"}
+# Load libraries
+library(ggplot2)
+library(SingleCellExperiment)
+library(scater)
+library(viridis)
+library(dittoSeq)
+library(cowplot)
+library(scran)
+library(edgeR)
+library(CATALYST)
+library(cytomapper)
+
+# Read SingleCellExperiment object
+sce <- readRDS("output/SCEs/Tcell/TcellSCE_clustered.rds")
+
+# Subset CD8+ and CD4+ T cells separately
+sce_CD8 <- sce[,which(sce$clustername == "T_CD8")]
+sce_CD4 <- sce[,which(sce$clustername %in% c("T-CD4", "Treg"))]
+```
+
+
+# Choose genes for clustering and UMAP
+
+```{r choose-clustering-genes}
+markers_include_CD8 <- c("CD38", "CD3", "LAG-3", "CD279", "GITR", "CD7", "Granzyme_B", "TCF7", "CXCL13", "CD8a", "Tim-3", "IRF4")
+
+markers_include_CD4 <- c("CD38", "CD3", "CD279", "GITR", "CD7", "TCF7", "CXCL13", "CD4", "FOXP3")
+
+markers_include_immune_general <- c( "MPO", "CD38", "HLA-DR", "CD15", "CD68", "CD163", "CD20", "CD3", "CD11c", "CD7","FOXP3", "CD8a", "CD4")
+```
+
+# UMAP representation
+```{r compute-UMAP-immune-general}
+sce_immune <- readRDS("output/SCEs/Tcell/TcellSCE_subclustered.rds")
+
+# Subset object
+sce_immune <- sce_immune[,which(sce_immune$cell_class == "immune")]
+
+# Exclude HLA-DR_high cells (undefined cell class)
+sce_immune <- sce_immune[,which(sce_immune$celltype != "HLA-DR_high")]
+
+# Classify neutrophils as myeloid cells
+sce_immune$celltype <- ifelse(sce_immune$celltype == "neutrophil", "myeloid", sce_immune$celltype)
+
+sce_immune$celltype <- as.factor(sce_immune$celltype)
+
+sce_immune <- runUMAP(sce_immune, exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_immune, "normalized")) %in% markers_include_immune_general)
+
+T_col <- c("#3333FF", "#e08104", "#138a33", "#2b9fd9", "#7dc206")
+names(T_col) <- levels(sce_immune$celltype)
+
+dittoDimPlot(sce_immune, var = "celltype", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = T_col, opacity = 0.3) 
+```
+
+
+Separate for CD8+ and CD4+ T cells.
+
+```{r compute-UMAP}
+
+sce_CD8 <- runUMAP(sce_CD8, exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_CD8, "normalized")) %in% markers_include_CD8)
+
+sce_CD4 <- runUMAP(sce_CD4, exprs_values = "normalized", 
+                     subset_row = rownames(assay(sce_CD4, "normalized")) %in% markers_include_CD4)
+```
+
+## Visualize features and marker expression levels on UMAP
+
+### CD8+ T cells
+
+```{r visualize-features-umap-CD8, message = FALSE, fig.width=7, fig.height=5}
+dittoDimPlot(sce_CD8, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD8)$colour_vectors$tissuetype, opacity = 0.3) 
+
+dittoDimPlot(sce_CD8, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                            color.panel = metadata(sce_CD8)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.7)
+
+dittoDimPlot(sce_CD8, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD8)$colour_vectors$Location, opacity = 0.3)
+
+dittoDimPlot(sce_CD8, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD8)$colour_vectors$Location, split.by = "Location",opacity = 0.7)
+```
+
+```{r scaled-expression-umap-CD8, message=FALSE, fig.width=35, fig.height=25}
+p.list <- list()
+for(i in rownames(sce_CD8)){
+  p.list[[i]] <- plotUMAP(sce_CD8, colour_by = i, by_exprs_values = "scaled", 
+                          point_size = 0.5, point_alpha = 1)  + scale_colour_gradient2(name = i, low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-3, 3), na.value = "#b2182b")
+}
+
+plot_grid(plotlist = p.list, ncol = 7)
+```
+
+### CD4+ T cells
+
+```{r visualize-features-umap-CD4, message = FALSE, fig.width=7, fig.height=5}
+
+dittoDimPlot(sce_CD4, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD4)$colour_vectors$tissuetype, opacity = 0.3) 
+
+dittoDimPlot(sce_CD4, var = "Tissue.Type", reduction.use = "UMAP", size = 0.5, 
+                            color.panel = metadata(sce_CD4)$colour_vectors$tissuetype, split.by = "Tissue.Type", opacity = 0.7)
+
+dittoDimPlot(sce_CD4, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD4)$colour_vectors$Location, opacity = 0.3)
+
+dittoDimPlot(sce_CD4, var = "Location", reduction.use = "UMAP", size = 0.5, 
+                               color.panel = metadata(sce_CD4)$colour_vectors$Location, split.by = "Location",opacity = 0.7)
+
+```
+
+```{r scaled-expression-umap-CD4, message=FALSE, fig.width=35, fig.height=25}
+p.list <- list()
+for(i in rownames(sce_CD4)){
+  p.list[[i]] <- plotUMAP(sce_CD4, colour_by = i, by_exprs_values = "scaled", 
+                          point_size = 0.5, point_alpha = 1)  + scale_colour_gradient2(name = i, low = "#2166ac", mid = "white", high = "#b2182b", limits = c(-3, 3), na.value = "#b2182b")
+}
+
+plot_grid(plotlist = p.list, ncol = 7)
+```
+
+# Run graph-based clustering
+
+Use normalized counts for clustering, because this provides a better separation of noise and actual signal compared to arcsinh-transformed counts.  
+Include only markers that were also used for UMAP.
+
+## CD8+ clustering
+
+```{r clustering-CD8}
+
+cluster_counts_normalized <- subset(assay(sce_CD8, "normalized"), rownames(assay(sce_CD8, "normalized")) %in% markers_include_CD8)
+
+g <- buildSNNGraph(cluster_counts_normalized, k=50, type = "jaccard")
+clust<- igraph::cluster_louvain(g)$membership
+table(clust)
+
+# add cluster information to sce object
+sce_CD8$cluster_k50 <- as.factor(clust)
+
+# Remove tiny cluster 5 (likely CXCL13-speckles)
+sce_CD8 <- sce_CD8[,which(sce_CD8$cluster_k50 != 5)]
+```
+
+Manual annotation of CD8+ T cell clusters and subtypes (i.e. metaclusters) based on mean marker expression.
+
+```{r cluster_annotation-CD8, fig.width=7, fig.height=5}
+labels <- read.csv("data/cluster_annotations/CD8_cluster_annotation.csv")
+
+label_clustername <- labels$clustername[match(sce_CD8$cluster_k50, labels$cluster)]
+sce_CD8$Tcell_cluster <- label_clustername
+label_subtype <- labels$subtype[match(sce_CD8$cluster_k50, labels$cluster)]
+sce_CD8$Tcell_subtype <- label_subtype
+
+#plot on umap
+dittoDimPlot(sce_CD8, var = "Tcell_cluster", reduction.use = "UMAP", size = 0.5, opacity = 0.5)
+dittoDimPlot(sce_CD8, var = "Tcell_subtype", reduction.use = "UMAP", size = 0.5, opacity = 0.5)
+```
+
+## CD4+ clustering
+
+```{r clustering-CD4}
+cluster_counts_normalized <- subset(assay(sce_CD4, "normalized"), rownames(assay(sce_CD4, "normalized")) %in% markers_include_CD4)
+
+g <- buildSNNGraph(cluster_counts_normalized, k=50, type = "jaccard")
+clust<- igraph::cluster_louvain(g)$membership
+table(clust)
+
+# add cluster information to sce object
+sce_CD4$cluster_k50 <- as.factor(clust)
+
+```
+
+Manual annotation of CD4+ T cell clusters and subtypes (i.e. metaclusters) based on mean marker expression.
+
+```{r cluster_annotation-CD4, fig.width=7, fig.height=5}
+labels <- read.csv("data/cluster_annotations/CD4_cluster_annotation.csv")
+
+label_clustername <- labels$clustername[match(sce_CD4$cluster_k50, labels$cluster)]
+sce_CD4$Tcell_cluster <- label_clustername
+label_subtype <- labels$subtype[match(sce_CD4$cluster_k50, labels$cluster)]
+sce_CD4$Tcell_subtype <- label_subtype
+
+dittoDimPlot(sce_CD4, var = "Tcell_cluster", reduction.use = "UMAP", size = 0.5,  opacity = 0.5)
+dittoDimPlot(sce_CD4, var = "Tcell_subtype", reduction.use = "UMAP", size = 0.5)
+```
+
+# Heatmap for all T cell types together
+
+```{r ExprsHeatmap-CD4CD8, fig.width=10, fig.height=6}
+sce_T <- cbind(sce_CD4, sce_CD8)
+
+# Assign colors to subtypes
+sce_T$Tcell_subtype <- factor(sce_T$Tcell_subtype)
+T_col <- c("#666600", "#93D50F", "#CCCC00", "#00CC00", "#00FF00", "#003319", "#0FD5B4", "#66FFFF", "#00CCCC", "#3333FF", "#99CCFF")
+names(T_col) <- levels(sce_T$Tcell_subtype)
+
+sce_T$CD4CD8 <- ifelse(sce_T$clustername == "T_CD8", "CD8", "CD4")
+sce_T$sample_id <- sce_T$ROI_ID
+sce_T$cluster_id <- sce_T$Tcell_cluster
+sce_T$condition <- factor(sce_T$Location)
+
+markers_include <- c("CD38", "CD3", "LAG-3", "CD279", "GITR", "CD7", "Granzyme_B", "TCF7", "CXCL13", "CD8a", "Tim-3", "IRF4", "CD4", "FOXP3")
+markers_state <- c("Ki-67")
+rowData(sce_T)$marker_class <- ifelse(rownames(sce_T) %in% markers_include, "type", ifelse(rownames(sce_T) %in% markers_state, "state", "none"))
+
+metadata(sce_T)$cluster_codes <- data.frame(Tcell_cluster = factor(sce_T$Tcell_cluster), CD4CD8 = factor(sce_T$CD4CD8), Tcell_subtype = factor(sce_T$Tcell_subtype))
+
+plotMultiHeatmap(sce_T, 
+hm1 = "type", hm2 = "state", 
+k = "Tcell_cluster", m = "Tcell_subtype", col_dend = c(TRUE, TRUE), assay = "counts", scale = "last", bars = TRUE, perc = TRUE, fun = "mean", row_anno = TRUE, m_pal = T_col)
+
+plotMultiHeatmap(sce_T, 
+hm1 = "type", hm2 = "state", 
+k = "Tcell_subtype", m = "CD4CD8", col_dend = c(TRUE, TRUE), assay = "counts", scale = "last", bars = TRUE, perc = TRUE, fun = "mean", row_anno = TRUE, m_pal = c("orange", "darkgreen"), k_pal = T_col)
+```
+
+# UMAP in final subtype colors
+
+```{r umap-colors}
+T_col_CD8 <- T_col[3:8]
+dittoDimPlot(sce_CD8, var = "Tcell_subtype", reduction.use = "UMAP", size = 0.5, opacity = 0.5, color.panel = T_col_CD8)
+
+T_col_CD4 <- T_col[c(1:2, 9:11)]
+dittoDimPlot(sce_CD4, var = "Tcell_subtype", reduction.use = "UMAP", size = 0.5, opacity = 0.7, color.panel = T_col_CD4)
+```
+
+
+# Plot subtype proportions per patient (separated by tissue type)
+
+```{r proportions-per-patient}
+sce_T$sample_id <- sce_T$Patient.ID
+sce_T$condition <- factor(sce_T$Tissue.Type)
+plotAbundances(sce_T, k = "Tcell_subtype", by = "sample_id", group_by = "condition")
+```
+
+# Save SCE objects
+
+Also add subtype information to full object and save.
+
+```{r save-SCE}
+sce$Tcell_subtype <- "none"
+sce$Tcell_cluster <- "none"
+Tcell_ids <- colnames(sce_T)
+sce[,Tcell_ids]$Tcell_subtype <- sce_T$Tcell_subtype
+sce[,Tcell_ids]$Tcell_cluster <- sce_T$Tcell_cluster
+
+saveRDS(sce, "output/SCEs/Tcell/TcellSCE_subclustered.rds")
+saveRDS(sce_CD8, "output/SCEs/Tcell/TcellSCE_CD8.rds")
+saveRDS(sce_CD4, "output/SCEs/Tcell/TcellSCE_CD4.rds")
+```
+
+
+
